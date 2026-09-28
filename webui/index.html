@@ -154,12 +154,22 @@ async function loadInto(text, name) {
 
 async function indexDoc() {
   const text = $("doc").value;
+  if (text === indexedText) return;            // nothing changed — no work to do
+  const firstTime = indexedText === "";
   $("docStat").textContent = "indexing…";
   try {
-    const info = await api("/api/index", {text, doc_name: docName});
+    // First index of a document builds everything; later calls are edits and go
+    // to /api/update, which only recomputes the passages whose text changed.
+    const info = firstTime
+      ? await api("/api/index", {text, doc_name: docName})
+      : await api("/api/update", {text});
     indexedText = text;
     setBadges({...info.status, indexed: true, chars: info.chars, n_chunks: info.n_chunks});
-    $("findMeta").textContent = `Indexed ${info.n_chunks} passages (${info.strategy}, ${info.mean_chars} chars avg).`;
+    const reuse = info.reencoded_chunks === 0
+      ? `reused all ${info.reused_chunks} passages`
+      : `re-encoded ${info.reencoded_chunks}, reused ${info.reused_chunks}`;
+    $("findMeta").textContent =
+      `${info.n_chunks} passages (${info.strategy}) — ${reuse} in ${info.index_ms} ms.`;
   } catch (e) {
     $("findMeta").textContent = "Index failed: " + e.message;
   }
@@ -282,6 +292,18 @@ $("file").onchange = async (e) => {
   if (!f) return;
   await loadInto(await f.text(), f.name);
 };
+
+// Auto re-index while editing, debounced. Safe to do now that re-indexing is
+// incremental — with the real encoder an unchanged passage is never re-encoded.
+// Only runs after the document has been indexed once, so typing into an empty
+// editor does not start firing background work.
+let indexTimer = null;
+$("doc").addEventListener("input", () => {
+  if (!indexedText) return;
+  clearTimeout(indexTimer);
+  indexTimer = setTimeout(indexDoc, 1200);
+});
+
 refreshHealth();
 </script>
 </body>

@@ -8,6 +8,7 @@
 #   ./run.sh search "..."    semantic search from the terminal
 #   ./run.sh ask "..."       cited answer from the terminal (needs a key)
 #   ./run.sh eval            measure semantic vs regex on ground-truth queries
+#   ./run.sh bench           measure what incremental re-indexing saves
 #   ./run.sh test            run the test suite
 #   ./run.sh install-neural  opt in to the real local encoder (bge-small)
 # =============================================================================
@@ -93,6 +94,12 @@ case "$cmd" in
     need_py
     banner "EVAL — does semantic search beat regex? measured."
     exec "$PY" -m raggy.eval "$@"
+    ;;
+
+  bench)
+    need_py
+    banner "BENCH — what incremental re-indexing saves"
+    exec "$PY" -m raggy.bench "$@"
     ;;
 
   test)

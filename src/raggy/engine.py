@@ -34,12 +34,13 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from bisect import bisect_right
 
 from raggy import chunking
 from raggy.encoder import EncoderChoice, resolve as resolve_encoder
 from raggy.llm import GROUNDED_SYSTEM, LLMClient, build_user_prompt
-from raggy.retrievers import SearchIndex, tokenize
+from raggy.retrievers import IndexCache, SearchIndex, tokenize
 
 # Below this confidence we abstain rather than generate. CALIBRATED, not guessed:
 # `./run.sh eval` sweeps the threshold against labelled answerable/unanswerable
@@ -73,19 +74,58 @@ class RaggyEngine:
         self._encoder_model = encoder_model
         self._line_starts: list[int] = [0]
 
+        # Incremental-indexing state.
+        # ⚠️ The encoder is resolved ONCE and reused: on the neural path,
+        # `resolve_encoder` constructs a SentenceTransformer, and doing that on
+        # every keystroke-triggered re-index reloads the model each time.
+        self._resolved: EncoderChoice | None = None
+        self._resolved_key: tuple | None = None
+        self._cache = IndexCache()
+        self._cache_doc: str | None = None
+        self._cache_encoder: str | None = None
+
+    # --------------------------------------------------------------- encoder
+    def _encoder_choice(self) -> EncoderChoice:
+        key = (self._encoder_kind, self._encoder_model)
+        if self._resolved is None or self._resolved_key != key:
+            self._resolved = resolve_encoder(self._encoder_kind, self._encoder_model)
+            self._resolved_key = key
+        return self._resolved
+
     # ------------------------------------------------------------------ index
     def index(self, text: str, doc_name: str = "untitled") -> dict:
-        """(Re)index the whole document. Safe to call on every edit-save."""
+        """(Re)index the document, reusing everything that did not change.
+
+        Safe — and cheap — to call on every edit. Passages whose text is
+        unchanged keep their tokens, and (with a real encoder) their embedding
+        vectors, via the content-addressed `IndexCache`. The returned
+        `reused_chunks` / `reencoded_chunks` say exactly what was recomputed.
+        """
+        started = time.perf_counter()
+        changed = self._changed_chars(self.text, text)
         self.text = text
-        self.doc_name = doc_name
         self._line_starts = [0] + [m.end() for m in re.finditer(r"\n", text)]
 
-        self.encoder = resolve_encoder(self._encoder_kind, self._encoder_model)
+        self.encoder = self._encoder_choice()
+
+        # ⚠️ INVALIDATE ON CONTEXT CHANGE. The cache maps text -> vector, and a
+        # vector is only meaningful for the model that produced it. A different
+        # document or a different encoder must not reuse the old entries, or we
+        # would compare vectors from two models — which returns results that
+        # look fine and are wrong.
+        if doc_name != self._cache_doc or self.encoder.name != self._cache_encoder:
+            self._cache = IndexCache()
+            self._cache_doc = doc_name
+            self._cache_encoder = self.encoder.name
+
+        self.doc_name = doc_name
         self.chunks = chunking.chunk_text(
             text, strategy=self.strategy, target_chars=self.target_chars,
             overlap=self.overlap)
-        self.search_index = SearchIndex.build(self.chunks, encoder=self.encoder.encoder)
+        self.search_index = SearchIndex.build(
+            self.chunks, encoder=self.encoder.encoder, cache=self._cache)
 
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
         return {
             "doc_name": doc_name,
             "chars": len(text),
@@ -94,8 +134,40 @@ class RaggyEngine:
             "encoder": self.encoder.name,
             "encoder_note": self.encoder.note,
             "is_neural": self.encoder.is_neural,
+            # incremental bookkeeping
+            "changed_chars": changed,
+            "reused_chunks": self.search_index.reused_chunks,
+            "reencoded_chunks": self.search_index.reencoded_chunks,
+            "index_ms": round(elapsed_ms, 2),
             **chunking.chunk_stats(self.chunks),
         }
+
+    def update(self, text: str) -> dict:
+        """Incremental re-index after an edit of the SAME document.
+
+        Thin alias for `index`; separate name only so callers can say what they
+        mean — and so this is where the "same document" assumption lives.
+        """
+        return self.index(text, self.doc_name or "untitled")
+
+    @staticmethod
+    def _changed_chars(old: str, new: str) -> int:
+        """Size of the changed region, by common prefix/suffix.
+
+        O(n) and enough for the editor case: typing, deleting, or editing a
+        paragraph changes one contiguous region. (A move/paste elsewhere shows up
+        as a larger region — which is correct, it IS a bigger change.)
+        """
+        if old == new:
+            return 0
+        n = min(len(old), len(new))
+        p = 0
+        while p < n and old[p] == new[p]:
+            p += 1
+        s = 0
+        while s < (n - p) and old[len(old) - 1 - s] == new[len(new) - 1 - s]:
+            s += 1
+        return max(len(old), len(new)) - p - s
 
     @property
     def is_indexed(self) -> bool:
@@ -275,4 +347,6 @@ class RaggyEngine:
             "threshold": self.threshold,
             "llm_available": self.llm.available,
             "llm_model": self.llm.model if self.llm.available else None,
+            "cache_entries": len(self._cache),
+            "cache_hits": self._cache.hits,
         }

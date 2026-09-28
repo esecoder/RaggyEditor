@@ -72,6 +72,16 @@ def _handle_api(path: str, body: dict) -> tuple[int, dict]:
             info = _ENGINE.index(text, body.get("doc_name", "untitled"))
             return 200, {"ok": True, **info, "status": _ENGINE.status()}
 
+        if path == "/api/update":
+            # Incremental re-index of the already-open document. Kept distinct
+            # from /api/index so a client can say "this is an edit" and get the
+            # reuse stats without implying a fresh document.
+            text = body.get("text")
+            if not isinstance(text, str):
+                return 400, {"error": "body must include a string 'text'"}
+            info = _ENGINE.update(text) if _ENGINE.is_indexed else _ENGINE.index(text)
+            return 200, {"ok": True, **info, "status": _ENGINE.status()}
+
         if path == "/api/search":
             q = body.get("query", "")
             if not q:

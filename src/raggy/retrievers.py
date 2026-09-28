@@ -42,6 +42,7 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections import Counter
@@ -397,6 +398,70 @@ def ndcg_at_k(retrieved: list, gold: list, k: int | None = None) -> float:
 
 
 # =============================================================================
+# THE CHUNK CACHE — what makes re-indexing incremental
+# =============================================================================
+class IndexCache:
+    """Content-addressed cache for chunk tokenisation and embeddings.
+
+    ⚠️ KEYED BY THE CHUNK'S TEXT, NOT ITS POSITION. That is the whole trick.
+
+    When you insert a sentence near the top of a document, every later passage
+    moves down by some number of characters — but its TEXT is unchanged. A
+    position-keyed cache would miss on all of them; a text-keyed cache hits on
+    all of them, and only the passages whose text actually changed are
+    re-tokenised and re-embedded.
+
+    The hash is blake2b of the text that is actually indexed (chunk text +
+    heading), so two passages that differ only in their heading are distinct
+    entries — which is correct, because the heading is part of the encoded text.
+
+    ⚠️ Embedding vectors are only reused for a REAL encoder, whose vectors are a
+    pure function of one passage. LSA vectors are not: TF-IDF and the SVD basis
+    are fit over the whole corpus, so adding text changes every other vector.
+    `SearchIndex` handles that distinction; this class just stores what it is
+    given.
+    """
+
+    def __init__(self):
+        self._tokens: dict[str, list[str]] = {}
+        self._vectors: dict[str, "np.ndarray"] = {}
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def _key(text: str) -> str:
+        return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+
+    # -- tokens ------------------------------------------------------------
+    def get_tokens(self, text: str) -> list[str] | None:
+        v = self._tokens.get(self._key(text))
+        if v is None:
+            self.misses += 1
+        else:
+            self.hits += 1
+        return v
+
+    def put_tokens(self, text: str, tokens: list[str]) -> None:
+        self._tokens[self._key(text)] = tokens
+
+    # -- vectors -----------------------------------------------------------
+    def get_vector(self, text: str):
+        return self._vectors.get(self._key(text))
+
+    def put_vector(self, text: str, vec) -> None:
+        self._vectors[self._key(text)] = vec
+
+    def clear(self) -> None:
+        self._tokens.clear()
+        self._vectors.clear()
+        self.hits = 0
+        self.misses = 0
+
+    def __len__(self) -> int:
+        return len(self._tokens)
+
+
+# =============================================================================
 # THE SEARCH INDEX
 # =============================================================================
 class SearchIndex:
@@ -405,28 +470,63 @@ class SearchIndex:
     `chunks` are `raggy.chunking.Chunk` objects (they carry `.text`, `.heading`,
     `.start`, `.end`). The index reads only `.text`/`.heading`, so it is
     agnostic to how they were produced.
+
+    Pass an `IndexCache` to build incrementally: passages whose text is already
+    in the cache reuse their tokens, and — with a real encoder — their vectors.
+    `reused_chunks` / `reencoded_chunks` report what actually happened.
     """
 
-    def __init__(self, chunks: list, encoder=None):
+    def __init__(self, chunks: list, encoder=None, cache: IndexCache | None = None):
         self.chunks = chunks
-        self.tokens = [tokenize(c.text + " " + c.heading) for c in chunks]
-        self.bm25 = BM25(self.tokens)
         self.encoder = encoder
         self.encoder_name = getattr(encoder, "model_name", None) or "lsa-tfidf-svd"
+        self.cache = cache if cache is not None else IndexCache()
+
+        # Indexed text = passage + heading, for both retrievers.
+        texts = [c.text + " " + c.heading for c in chunks]
+
+        # -- tokens (reused when the text is unchanged) --------------------
+        self.tokens: list[list[str]] = []
+        self.reused_chunks = 0
+        for t in texts:
+            cached = self.cache.get_tokens(t)
+            if cached is None:
+                cached = tokenize(t)
+                self.cache.put_tokens(t, cached)
+            else:
+                self.reused_chunks += 1
+            self.tokens.append(cached)
+        self.bm25 = BM25(self.tokens)
+
+        # -- dense ---------------------------------------------------------
+        self.reencoded_chunks = 0
         if len(chunks) < 3:
+            # SVD needs a non-degenerate matrix; too few passages -> lexical only.
             self.dense = None
         elif encoder is not None:
-            # Feed the encoder the same text the LSA path sees, so the two are
-            # compared on identical input.
-            self.dense = NeuralDenseIndex.build(
-                [c.text + " " + c.heading for c in chunks], encoder)
+            # ⚠️ Batch ONLY the misses. Encoding one at a time would be far
+            # slower than the batch call, and would erase the very win we want.
+            missing = [i for i, t in enumerate(texts) if self.cache.get_vector(t) is None]
+            if missing:
+                vecs = encoder.encode_docs([texts[i] for i in missing])
+                for i, v in zip(missing, vecs):
+                    self.cache.put_vector(texts[i], v)
+            self.reencoded_chunks = len(missing)
+            doc_vecs = np.stack([self.cache.get_vector(t) for t in texts])
+            self.dense = NeuralDenseIndex(doc_vecs, encoder)
         else:
+            # ⚠️ LSA is corpus-global: adding one passage changes IDF and the SVD
+            # basis, so every vector is recomputed. Tokenisation is still reused.
+            # This is why incremental indexing is a big win for the neural path
+            # and merely a small one here — and why the benchmark reports both.
             self.dense = DenseIndex.build(self.tokens)
+            self.reencoded_chunks = len(chunks)
+
         self.reranker: Reranker | None = None
 
     @classmethod
-    def build(cls, chunks: list, encoder=None) -> "SearchIndex":
-        return cls(chunks, encoder)
+    def build(cls, chunks: list, encoder=None, cache: IndexCache | None = None) -> "SearchIndex":
+        return cls(chunks, encoder, cache)
 
     def retrieve(self, query: str, k: int = 10, mode: str = "hybrid",
                  pool: int = 50) -> tuple[list[int], dict]:

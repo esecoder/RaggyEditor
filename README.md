@@ -98,6 +98,48 @@ a tiebreak. That is in `engine.py`, with the measurement next to it.
 
 ---
 
+## Editing a large document: incremental re-index
+
+You edit a 200-page document and press save. Re-chunking and re-embedding the
+whole thing on every save is the obvious implementation and the wrong one. So the
+cache is keyed by each passage's **text, not its position** — when an edit shifts
+every later passage down, their text is unchanged and they are reused. Only the
+passages whose text actually changed are recomputed.
+
+`./run.sh bench` measures it (warm model, 400 passages, one paragraph edited):
+
+| encoder | cold index (every save, today) | edit → incremental | speedup | re-encoded |
+|---|---:|---:|---:|---:|
+| **bge-small (real)** | 5,301 ms | **104 ms** | **51×** | 1 of 400 |
+| LSA (offline fallback) | 7,144 ms | 7,870 ms | 0.9× | 400 of 400 |
+
+Two things to read honestly:
+
+- **The neural path is the win.** 400 passages re-encoded becomes 1; and a
+  re-index with no change at all is **~9 ms** because nothing is encoded. Both
+  `demo` and the editor UI now re-index automatically while you type.
+- **LSA gets no speedup, and the table says so.** TF-IDF and the SVD basis are
+  fit over the *whole corpus*, so adding one passage changes every vector — there
+  is no per-passage vector to reuse. That is a property of LSA, not a bug, and it
+  is a second reason the real encoder is the production path. (Its tokenisation
+  is still cached; the SVD refit dominates.)
+
+⚠️ **The correctness guarantee is the point, and it is tested.** An incremental
+re-index must be *indistinguishable* from a cold rebuild of the same text — same
+passages, same offsets, same ranking. `tests/test_incremental.py` asserts exactly
+that, because the failure mode of a cache is not a crash: it is retrieval
+returning results that look fine and are wrong.
+
+⚠️ **Two things invalidate the cache**, both tested: switching to a **different
+document**, and any change to the **encoder**. A vector is only meaningful for
+the model that produced it; reusing vectors across two models is silently wrong.
+
+The same work also stopped a real waste elsewhere: the encoder is now resolved
+**once** and reused, instead of constructing a `SentenceTransformer` on every
+re-index call.
+
+---
+
 ## Architecture
 
 ```
@@ -141,7 +183,8 @@ the retrieval lives in `src/raggy/` where it can be tested without a GUI.
 ./run.sh install     # creates .venv, installs numpy (the only hard dependency)
 ./run.sh demo        # offline tour over the sample document — no key needed
 ./run.sh eval        # the measured comparison above
-./run.sh test        # 36 tests, no network
+./run.sh bench       # what incremental re-indexing saves
+./run.sh test        # 48 tests, no network
 
 # optional: the real local encoder (uses the cached bge-small model, ~130MB once)
 ./run.sh install-neural
@@ -202,13 +245,14 @@ citations, and gives the model an explicit `NOT_IN_DOCUMENT` exit — because
 | Path | What it is |
 |---|---|
 | [`src/raggy/chunking.py`](src/raggy/chunking.py) | Fixed / recursive / sentence chunking **that keeps document offsets**, so the editor can highlight the exact span |
-| [`src/raggy/retrievers.py`](src/raggy/retrievers.py) | BM25, dense (LSA + neural), RRF fusion, a feature reranker, and the four retrieval metrics |
+| [`src/raggy/retrievers.py`](src/raggy/retrievers.py) | BM25, dense (LSA + neural), RRF fusion, a feature reranker, the metrics, and the **content-addressed chunk cache** |
 | [`src/raggy/encoder.py`](src/raggy/encoder.py) | The encoder policy: `auto` / `neural` / `lsa`, and it names which one you got |
-| [`src/raggy/engine.py`](src/raggy/engine.py) | Index a document; semantic search; ask with citations; **calibrated abstention** |
+| [`src/raggy/engine.py`](src/raggy/engine.py) | Index a document (incrementally); semantic search; ask with citations; **calibrated abstention** |
 | [`src/raggy/llm.py`](src/raggy/llm.py) | stdlib OpenAI-compatible client + the grounding prompt |
-| [`src/raggy/server.py`](src/raggy/server.py) | The stdlib HTTP sidecar (`/api/index`, `/search`, `/regex`, `/ask`, `/health`) |
+| [`src/raggy/server.py`](src/raggy/server.py) | The stdlib HTTP sidecar (`/api/index`, `/update`, `/search`, `/regex`, `/ask`, `/health`) |
 | [`src/raggy/cli.py`](src/raggy/cli.py) | `demo` / `search` / `ask` from the terminal |
 | [`src/raggy/eval.py`](src/raggy/eval.py) | The labelled evaluation + threshold calibration |
+| [`src/raggy/bench.py`](src/raggy/bench.py) | The incremental-index cost benchmark |
 | [`cudatext_plugin/`](cudatext_plugin/) | The CudaText plugin (thin HTTP client) |
 | [`webui/index.html`](webui/index.html) | The browser editor, no build step |
 | [`samples/`](samples/) | The operations handbook the demo and eval use |
@@ -217,12 +261,14 @@ citations, and gives the model an explicit `NOT_IN_DOCUMENT` exit — because
 
 ## Verified / not verified
 
-✅ Runs offline on macOS with `numpy` alone (36 tests, no network).
+✅ Runs offline on macOS with `numpy` alone (48 tests, no network).
 ✅ The offset invariant (`chunk.text == document[start:end]`) is asserted in the
 chunker **and** tested for every strategy — a highlight that is off by a few
 characters is worse than none.
 ✅ Retrieval numbers above are produced by `./run.sh eval` on this machine.
 ✅ Abstention threshold calibrated, with the over-refusal rate reported.
+✅ Incremental re-index is asserted **identical to a cold rebuild** (texts,
+offsets, rankings), and both invalidation rules are tested.
 ✅ Traversal-protected static serving; the sidecar binds `127.0.0.1` only.
 
 ⚠️ **The CudaText plugin itself is not executed by the test suite** — CudaText is
