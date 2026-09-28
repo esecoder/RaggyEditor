@@ -1,0 +1,44 @@
+[info]
+title=RaggyEditor
+desc=Find by meaning: semantic search and cited answers over the open document, from a local RAG engine.
+type=cudatext-plugin
+subdir=raggy_editor
+homepage=https://github.com/esecoder/RaggyEditor
+
+[item1]
+section=commands
+caption=RaggyEditor\Semantic Find...
+method=cmd_semantic_find
+hotkey=Ctrl+Alt+F
+
+[item2]
+section=commands
+caption=RaggyEditor\Regex Find...
+method=cmd_regex_find
+
+[item3]
+section=commands
+caption=RaggyEditor\-
+method=_
+
+[item4]
+section=commands
+caption=RaggyEditor\Ask the document...
+method=cmd_ask
+hotkey=Ctrl+Alt+A
+
+[item5]
+section=commands
+caption=RaggyEditor\-
+method=_
+
+[item6]
+section=commands
+caption=RaggyEditor\Start sidecar
+method=cmd_start_server
+
+[item7]
+section=commands
+caption=RaggyEditor\Status / settings
+method=cmd_status
+menu=o

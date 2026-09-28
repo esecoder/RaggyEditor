@@ -1,0 +1,197 @@
+MERIDIAN SYNC SERVICE — OPERATIONS HANDBOOK
+Version 4.2 — Last updated 2026-08-30
+Owner: Platform Reliability
+
+================================================================
+1. PURPOSE AND SCOPE
+================================================================
+
+Meridian Sync is the background service that keeps the primary datastore and the
+read replicas consistent. It is not a request-path service: user-facing latency
+does not depend on it directly, but when it falls behind, the replicas serve
+stale data and dashboards disagree with each other.
+
+This handbook is written for the on-call engineer. It assumes you can reach the
+admin CLI and read the service log. It does not cover the client SDK.
+
+================================================================
+2. ARCHITECTURE IN ONE PARAGRAPH
+================================================================
+
+A single coordinator process owns the change stream and hands ordered batches to
+a pool of worker processes. Each worker applies a batch to one replica and
+reports the highest sequence number it has durably written. The coordinator
+tracks the slowest worker; the gap between that worker and the head of the
+stream is the replication lag reported on the dashboard.
+
+State lives in three places: the change stream (durable, append-only), a small
+checkpoint file per replica, and an in-memory queue in the coordinator. Only the
+change stream is a source of truth. If the coordinator restarts, it rebuilds
+the in-memory queue from the checkpoint and the stream; nothing is lost.
+
+================================================================
+3. CAPACITY AND BACKPRESSURE
+================================================================
+
+The coordinator reads the change stream as fast as it can and pushes batches
+into a bounded queue. When the queue is full it stops reading. That is the
+backpressure signal: the read position in the stream stops advancing while the
+write position keeps moving.
+
+Sustained backpressure means the workers cannot keep up with the write rate of
+the primary. The earliest sign is not an error — it is rising replication lag
+with a healthy CPU profile, because the workers are waiting on disk, not
+computing. Do not add workers in that situation; the bottleneck is the replica's
+storage, and more workers make the contention worse.
+
+The service is sized so that a single worker can absorb roughly 1.8 times the
+observed peak write rate. That headroom is deliberate: it is what lets a replica
+fall offline for maintenance without the lag becoming unbounded.
+
+================================================================
+4. COMMON ERRORS AND WHAT THEY MEAN
+================================================================
+
+ERR_CONN_4421
+  Raised when the coordinator cannot establish a connection to a replica within
+  the connect timeout (default 5s). Almost always a network or firewall change,
+  not a database problem. Check that the replica's listener port is reachable
+  from the coordinator host before touching the service.
+
+ERR_CONN_4422
+  The connection was established but the handshake did not complete. Usually a
+  certificate that expired on the replica side. Rotate the certificate and
+  restart the replica.
+
+ERR_AUTH_1180
+  Authentication to the replica failed. This is a credential problem: the
+  service account password was rotated without updating the secret the
+  coordinator reads. It is not related to ERR_CONN_4421 despite the similar
+  prefix.
+
+ERR_QUEUE_7003
+  The coordinator's queue reached its high-water mark and it stopped reading the
+  change stream. This is backpressure working as designed, not a fault. It only
+  becomes a fault when it persists for more than ten minutes, which means the
+  workers are genuinely saturated.
+
+ERR_APPLY_5510
+  A worker failed to apply a batch because a replica rejected a write (for
+  example, a constraint violation introduced by a schema change). The worker
+  parks the batch and retries with exponential backoff. If it does not clear,
+  the batch is written to the dead-letter file and the worker moves on.
+
+================================================================
+5. DIAGNOSING REPLICATION LAG
+================================================================
+
+Lag is the distance between the newest change in the stream and the newest
+change a replica has applied. It is reported in seconds, but it is really a
+count of pending changes divided by the apply rate — which is why a burst of
+small writes can show a scary-looking lag number that clears on its own.
+
+To find the cause, work outward from the coordinator:
+
+  1. If the queue is empty and lag is high, the coordinator is not reading fast
+     enough. Check its CPU and the stream read latency.
+  2. If the queue is full and lag is high, the workers are the bottleneck. Look
+     at replica disk latency first, then at the apply rate per worker.
+  3. If lag is high but the queue depth is normal and CPU is low, suspect a
+     clock problem on the replica. The lag is computed from timestamps and a
+     skewed clock reads as lag that never resolves.
+
+The single most useful command is the per-worker apply rate over the last five
+minutes; comparing workers isolates whether the problem is one replica or all of
+them.
+
+================================================================
+6. SAFELY RESTARTING THE SERVICE
+================================================================
+
+A restart is safe by design, but only if you follow the order. Restarting the
+coordinator first is fine: it rebuilds its queue from the checkpoints. Restarting
+a worker mid-batch is also fine: a batch is only acknowledged after the replica
+has durably written it.
+
+The dangerous sequence is restarting a replica while the coordinator still
+believes the worker is healthy. The coordinator will keep dispatching batches to
+a replica that is shutting down, and the batches will land in the dead-letter
+file. To avoid this, drain the worker first, confirm the queue for that worker is
+empty, and only then take the replica down.
+
+To restart the whole fleet safely, stop the coordinator, let every worker finish
+its in-flight batch, stop the workers, then restart in the reverse order.
+
+================================================================
+7. BACKUP AND RESTORE
+================================================================
+
+Only the change stream needs a backup. Replica checkpoints are disposable: they
+can be rebuilt by replaying the stream, which is slower but always correct.
+
+A restore always replays from the last stream backup. Expect the replay to be
+slower than live traffic by a factor of roughly two to three, because it skips
+the coordinator's batching optimisation and applies changes one at a time.
+
+Never restore a replica from a filesystem snapshot while the coordinator is
+running. The snapshot and the live checkpoint will disagree, and the disagreement
+is silent until the next failover.
+
+================================================================
+8. SECURITY NOTES
+================================================================
+
+The service account can read the change stream and write to replicas. It cannot
+read the primary. If you find you need the primary credential to debug a
+replication problem, that is a signal the problem is on the primary side, not in
+the sync service.
+
+All coordinator-to-worker traffic is mutually authenticated with certificates
+that rotate every 90 days. The rotation is automated; the only manual step is
+restarting the worker after a rotation if it was offline during the rotation
+window.
+
+================================================================
+9. WHEN TO ESCALATE
+================================================================
+
+Escalate to the platform team when any of the following is true:
+
+  - replication lag has exceeded twenty minutes and is still growing
+  - two or more replicas are in the dead-letter state at the same time
+  - the change stream read position is advancing but no worker reports progress
+  - a restore replay has run for longer than four times the expected duration
+
+Do not escalate a single dead-lettered batch. That is a normal operational
+event, and the batch can be replayed once the underlying constraint is fixed.
+
+================================================================
+10. GLOSSARY
+================================================================
+
+change stream
+  The durable, append-only log of every change to the primary datastore. The
+  source of truth for replication.
+
+checkpoint
+  A per-replica record of the highest sequence number durably applied. Used to
+  resume after a restart.
+
+coordinator
+  The single process that reads the change stream and dispatches ordered
+  batches to workers.
+
+dead-letter file
+  Where a worker writes a batch that cannot be applied after exhausting its
+  retries, so that it does not block the rest of the stream.
+
+high-water mark
+  The queue depth at which the coordinator deliberately stops reading the
+  change stream.
+
+replication lag
+  The difference between the newest change in the stream and the newest change a
+  replica has applied.
+
+worker
+  A process that applies batches to exactly one replica.

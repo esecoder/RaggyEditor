@@ -1,0 +1,47 @@
+[project]
+name = "raggy-editor"
+version = "0.1.0"
+description = "A plain-text editor whose Find is powered by RAG: regex, semantic search, and cited answers over the open document."
+requires-python = ">=3.11"
+
+# ---------------------------------------------------------------------------
+# THE ONE HARD DEPENDENCY.
+#
+# RaggyEditor is designed so that `./run.sh demo` works after exactly one
+# install. Everything else in the pipeline — BM25, TF-IDF+SVD dense retrieval,
+# RRF fusion, the reranker, the metrics — is implemented here on top of numpy.
+#
+# The HTTP sidecar uses the standard library (http.server), and the LLM client
+# uses urllib. That is deliberate: fewer moving parts is what lets this run on
+# a machine with no network and no API key.
+# ---------------------------------------------------------------------------
+dependencies = [
+  "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# The real semantic encoder. This is the production path the app switches to
+# automatically when it is installed; without it we fall back to LSA.
+#   uv pip install --python .venv/bin/python sentence-transformers
+neural = [
+  "sentence-transformers>=3.0",
+]
+# Only if you want to run the FastAPI server instead of the stdlib one.
+# The default sidecar needs none of this.
+serve = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/raggy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

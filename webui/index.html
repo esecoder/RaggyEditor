@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RaggyEditor — Find, but semantic</title>
+<style>
+  :root{
+    --bg:#f6f6f4; --panel:#ffffff; --ink:#1c1c1e; --muted:#6b7280; --line:#d8d8d2;
+    --accent:#2f6feb; --accent-soft:#e8f0fe; --warn:#b45309; --ok:#15803d;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{font:14px/1.5 var(--sans);color:var(--ink);background:var(--bg);display:flex;flex-direction:column}
+  header{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+  header h1{font-size:15px;margin:0;font-weight:600}
+  header .sub{color:var(--muted);font-size:12px}
+  .badge{font:11px/1 var(--mono);padding:4px 7px;border-radius:999px;border:1px solid var(--line);background:#f2f2ef;color:var(--muted);white-space:nowrap}
+  .badge.neural{background:#e7f6ec;border-color:#bfe6cb;color:var(--ok)}
+  .badge.lsa{background:#fdf1e3;border-color:#f2d4ad;color:var(--warn)}
+  .grow{flex:1}
+  .toolbar{display:flex;align-items:center;gap:8px;padding:7px 12px;background:#fbfbf9;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  button{font:13px var(--sans);padding:5px 11px;border:1px solid var(--line);background:#fff;border-radius:6px;cursor:pointer}
+  button:hover{border-color:#b9b9b1}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover{filter:brightness(1.06)}
+  input[type=text],select,textarea{font-family:var(--mono);font-size:13px}
+  input[type=text],select{padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:#fff}
+  .stat{font:11px var(--mono);color:var(--muted)}
+  main{flex:1;display:grid;grid-template-columns:minmax(0,1.15fr) minmax(340px,1fr);min-height:0}
+  #doc{width:100%;height:100%;border:0;border-right:1px solid var(--line);padding:12px 14px;resize:none;outline:none;background:#fff;line-height:1.55;tab-size:4}
+  aside{display:flex;flex-direction:column;min-height:0;background:var(--bg)}
+  .block{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+  .block h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 7px}
+  .findrow,.askrow{display:flex;gap:7px}
+  .findrow input,.askrow input{flex:1;min-width:0}
+  .results{overflow:auto;flex:1;min-height:0;margin:8px -4px 0;padding:0 4px}
+  .hint{color:var(--muted);font-size:12px;padding:6px 2px}
+  .res{border:1px solid var(--line);background:#fff;border-radius:7px;padding:8px 9px;margin-bottom:7px;cursor:pointer}
+  .res:hover{border-color:var(--accent);background:var(--accent-soft)}
+  .res .top{display:flex;gap:8px;align-items:baseline;justify-content:space-between}
+  .res .where{font:11px var(--mono);color:var(--accent)}
+  .res .scores{font:10px var(--mono);color:var(--muted);white-space:nowrap}
+  .res .snip{font:12px/1.45 var(--mono);color:#333;margin-top:4px;white-space:pre-wrap;word-break:break-word;max-height:5.2em;overflow:hidden}
+  mark{background:#fff2a8;padding:0 1px}
+  .answer{background:#fff;border:1px solid var(--line);border-radius:7px;padding:9px;font-size:13px;white-space:pre-wrap;margin-top:8px}
+  .answer .cite{color:var(--accent);font:11px var(--mono);cursor:pointer;text-decoration:underline}
+  .banner{font-size:12px;padding:7px 9px;border-radius:7px;margin-top:8px}
+  .banner.warn{background:#fdf1e3;border:1px solid #f2d4ad;color:#7a4b12}
+  .banner.ok{background:#e7f6ec;border:1px solid #bfe6cb;color:#14532d}
+  .conf{font:11px var(--mono)}
+  .conf.low{color:var(--warn)}
+  .conf.high{color:var(--ok)}
+  .spin{color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>RaggyEditor</h1>
+  <span class="sub">find, but by meaning</span>
+  <span class="grow"></span>
+  <span id="encBadge" class="badge">encoder: …</span>
+  <span id="llmBadge" class="badge">llm: …</span>
+</header>
+
+<div class="toolbar">
+  <button id="btnSample">Load sample</button>
+  <button id="btnOpen">Open file…</button>
+  <input id="file" type="file" style="display:none">
+  <button id="btnIndex" class="primary">Index document</button>
+  <span class="grow"></span>
+  <span id="docStat" class="stat">no document</span>
+</div>
+
+<main>
+  <textarea id="doc" spellcheck="false" placeholder="Open a file, load the sample, or paste text here — then press Index document."></textarea>
+
+  <aside>
+    <div class="block">
+      <h2>Find</h2>
+      <div class="findrow">
+        <select id="mode" title="How to match">
+          <option value="semantic">Semantic (by meaning)</option>
+          <option value="regex">Regex / literal</option>
+        </select>
+        <input id="q" type="text" placeholder="how do I fix an expired certificate?">
+        <button id="btnFind" class="primary">Find</button>
+      </div>
+      <div id="findMeta" class="hint">Try a paraphrase — no shared words needed.</div>
+      <div id="results" class="results"></div>
+    </div>
+
+    <div class="block">
+      <h2>Ask the document</h2>
+      <div class="askrow">
+        <input id="question" type="text" placeholder="Why is more workers not the answer when it is slow?">
+        <button id="btnAsk">Ask</button>
+      </div>
+      <div id="askMeta" class="hint">Grounded answers with citations, or an honest “not in this document”.</div>
+      <div id="answer"></div>
+    </div>
+  </aside>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let docName = "untitled";
+let indexedText = "";
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: {"Content-Type": "application/json"},
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  const data = await res.json().catch(() => ({error: "non-JSON response"}));
+  if (!res.ok && data.error) throw new Error(data.error);
+  return data;
+}
+
+function setBadges(s) {
+  const e = $("encBadge");
+  e.textContent = "encoder: " + (s.encoder || "none");
+  e.className = "badge " + (s.is_neural ? "neural" : "lsa");
+  e.title = s.encoder_note || "";
+  const l = $("llmBadge");
+  l.textContent = "llm: " + (s.llm_available ? s.llm_model : "off (search-only)");
+  l.className = "badge " + (s.llm_available ? "neural" : "");
+  $("docStat").textContent = s.indexed
+    ? `${docName} · ${s.chars.toLocaleString()} chars · ${s.n_chunks} passages`
+    : "no document indexed";
+}
+
+async function refreshHealth() {
+  try { const h = await api("/api/health"); setBadges(h); } catch (e) {}
+}
+
+async function loadInto(text, name) {
+  docName = name;
+  $("doc").value = text;
+  indexedText = "";
+  await indexDoc();
+}
+
+async function indexDoc() {
+  const text = $("doc").value;
+  $("docStat").textContent = "indexing…";
+  try {
+    const info = await api("/api/index", {text, doc_name: docName});
+    indexedText = text;
+    setBadges({...info.status, indexed: true, chars: info.chars, n_chunks: info.n_chunks});
+    $("findMeta").textContent = `Indexed ${info.n_chunks} passages (${info.strategy}, ${info.mean_chars} chars avg).`;
+  } catch (e) {
+    $("findMeta").textContent = "Index failed: " + e.message;
+  }
+}
+
+function linesUpTo(text, offset) {
+  let n = 1;
+  for (let i = 0; i < offset && i < text.length; i++) if (text[i] === "\n") n++;
+  return n;
+}
+
+function jumpTo(start, end) {
+  const ta = $("doc");
+  ta.focus();
+  ta.setSelectionRange(start, end);
+  // Bring the selection into view without a highlight-overlay.
+  const before = ta.value.slice(0, start);
+  const line = before.split("\n").length;
+  const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
+  const targetTop = (line - 1) * lh - ta.clientHeight / 2;
+  ta.scrollTop = Math.max(0, targetTop);
+}
+
+function esc(s) { return s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+
+function renderResults(data) {
+  const box = $("results");
+  box.innerHTML = "";
+  if (!data.results || !data.results.length) {
+    box.innerHTML = `<div class="hint">No results.</div>`;
+    return;
+  }
+  for (const r of data.results) {
+    const el = document.createElement("div");
+    el.className = "res";
+    const scores = data.kind === "regex"
+      ? `match ${r.rank}`
+      : `line ${r.line} · bm25 ${(r.bm25 ?? 0).toFixed(2)} · cos ${(r.dense ?? 0).toFixed(2)}`;
+    el.innerHTML =
+      `<div class="top"><span class="where">#${r.rank} · line ${r.line}</span>
+        <span class="scores">${scores}</span></div>
+       <div class="snip">${esc(r.text.slice(0, 220))}${r.text.length > 220 ? "…" : ""}</div>`;
+    el.onclick = () => jumpTo(r.start, r.end);
+    box.appendChild(el);
+  }
+}
+
+async function doFind() {
+  const q = $("q").value.trim();
+  if (!q) return;
+  if (!indexedText) await indexDoc();
+  const mode = $("mode").value;
+  $("findMeta").textContent = "searching…";
+  try {
+    const data = mode === "regex"
+      ? await api("/api/regex", {pattern: q, regex: true})
+      : await api("/api/search", {query: q, k: 8});
+    renderResults(data);
+    if (mode === "regex") {
+      $("findMeta").innerHTML = `<b>${data.count ?? data.results.length}</b> matches for /${esc(q)}/`;
+    } else {
+      const c = data.confidence ?? 0;
+      const cls = data.low_confidence ? "low" : "high";
+      $("findMeta").innerHTML =
+        `<b>${data.results.length}</b> semantic results · confidence ` +
+        `<span class="conf ${cls}">${c.toFixed(2)}</span>` +
+        (data.low_confidence ? ` (below threshold ${data.threshold} — maybe not in this document)` : "");
+    }
+  } catch (e) {
+    $("findMeta").textContent = "Find failed: " + e.message;
+  }
+}
+
+async function doAsk() {
+  const q = $("question").value.trim();
+  if (!q) return;
+  if (!indexedText) await indexDoc();
+  $("askMeta").textContent = "thinking…";
+  $("answer").innerHTML = "";
+  try {
+    const data = await api("/api/ask", {question: q, k: 5});
+    if (data.mode === "abstained") {
+      $("askMeta").textContent = "abstained";
+      $("answer").innerHTML = `<div class="banner warn">Not answered: ${esc(data.reason)}.</div>` +
+        (data.citations?.length ? `<div class="hint">Closest passages are shown in Find above.</div>` : "");
+    } else if (data.mode === "retrieval_only") {
+      $("askMeta").textContent = "retrieval only (no key)";
+      $("answer").innerHTML = `<div class="banner warn">${esc(data.reason)}.</div>`;
+      renderResults({results: data.citations, kind: "semantic"});
+    } else {
+      $("askMeta").innerHTML = `answered · confidence <span class="conf high">${(data.confidence ?? 0).toFixed(2)}</span>`;
+      let html = esc(data.answer).replace(/\[(\d+)\]/g, (m, n) => `<span class="cite" data-i="${n}">${m}</span>`);
+      $("answer").innerHTML = `<div class="answer" id="answerBody">${html}</div>`;
+      $("answerBody").querySelectorAll(".cite").forEach(el => {
+        el.onclick = () => {
+          const c = data.citations[parseInt(el.dataset.i, 10) - 1];
+          if (c) jumpTo(c.start, c.end);
+        };
+      });
+    }
+  } catch (e) {
+    $("askMeta").textContent = "Ask failed";
+    $("answer").innerHTML = `<div class="banner warn">${esc(e.message)}</div>`;
+  }
+}
+
+// ---- wiring -------------------------------------------------------------
+$("btnFind").onclick = doFind;
+$("q").addEventListener("keydown", e => { if (e.key === "Enter") doFind(); });
+$("btnAsk").onclick = doAsk;
+$("question").addEventListener("keydown", e => { if (e.key === "Enter") doAsk(); });
+$("btnIndex").onclick = indexDoc;
+$("btnSample").onclick = async () => {
+  const s = await api("/api/sample");
+  await loadInto(s.text, s.doc_name);
+};
+$("btnOpen").onclick = () => $("file").click();
+$("file").onchange = async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  await loadInto(await f.text(), f.name);
+};
+refreshHealth();
+</script>
+</body>
+</html>
