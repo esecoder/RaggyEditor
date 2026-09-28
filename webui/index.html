@@ -122,9 +122,17 @@ async function api(path, body) {
 
 function setBadges(s) {
   const e = $("encBadge");
-  e.textContent = "encoder: " + (s.encoder || "none");
-  e.className = "badge " + (s.is_neural ? "neural" : "lsa");
-  e.title = s.encoder_note || "";
+  if (s.encoder) {
+    e.textContent = "encoder: " + s.encoder;
+    e.className = "badge " + (s.is_neural ? "neural" : "lsa");
+    e.title = s.encoder_note || "";
+  } else {
+    // Not indexed yet: the encoder is resolved lazily on first index, so
+    // loading a model is not paid when the user only wants regex.
+    e.textContent = "encoder: idle (resolves on index)";
+    e.className = "badge";
+    e.title = "The dense encoder is chosen when the document is first indexed.";
+  }
   const l = $("llmBadge");
   l.textContent = "llm: " + (s.llm_available ? s.llm_model : "off (search-only)");
   l.className = "badge " + (s.llm_available ? "neural" : "");
