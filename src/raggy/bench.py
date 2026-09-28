@@ -92,10 +92,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="RaggyEditor incremental-index benchmark")
     ap.add_argument("--paragraphs", type=int, default=600,
                     help="document size (each paragraph ~300 chars)")
-    ap.add_argument("--encoder", default="both", choices=["lsa", "neural", "auto", "both"])
+    ap.add_argument("--encoder", default="both",
+                    choices=["lsa", "onnx", "neural", "auto", "both"])
     args = ap.parse_args()
 
-    kinds = ["lsa", "neural"] if args.encoder == "both" else [args.encoder]
+    # "both" compares the offline fallback against the shipping ONNX encoder.
+    kinds = ["lsa", "onnx"] if args.encoder == "both" else [args.encoder]
 
     print("=" * 78)
     print("RaggyEditor — cost of re-indexing after a one-paragraph edit")

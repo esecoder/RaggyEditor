@@ -230,7 +230,8 @@ def metrics_block(rows: list[dict], enc_name: str, k: int) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="RaggyEditor retrieval evaluation")
-    ap.add_argument("--encoder", default="both", choices=["lsa", "neural", "auto", "both"])
+    ap.add_argument("--encoder", default="both",
+                    choices=["lsa", "onnx", "neural", "auto", "both"])
     ap.add_argument("--k", type=int, default=K)
     args = ap.parse_args()
 
@@ -238,7 +239,8 @@ def main() -> None:
         sys.exit(f"sample document missing: {SAMPLE}")
     text = SAMPLE.read_text(encoding="utf-8")
 
-    kinds = ["lsa", "neural"] if args.encoder == "both" else [args.encoder]
+    # "both" compares the offline fallback against the shipping real encoder.
+    kinds = ["lsa", "onnx"] if args.encoder == "both" else [args.encoder]
 
     print("=" * 78)
     print("RaggyEditor — does semantic search beat Find? (measured, not claimed)")

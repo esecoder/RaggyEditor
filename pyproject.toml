@@ -1,40 +1,67 @@
 [project]
 name = "raggy-editor"
-version = "0.1.0"
-description = "A plain-text editor whose Find is powered by RAG: regex, semantic search, and cited answers over the open document."
+version = "0.2.0"
+description = "A plain-text editor whose Find works by meaning: hybrid retrieval, cited answers, and an offline fallback."
 requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
 
 # ---------------------------------------------------------------------------
-# THE ONE HARD DEPENDENCY.
+# THE ENGINE NEEDS ONE THING.
 #
-# RaggyEditor is designed so that `./run.sh demo` works after exactly one
-# install. Everything else in the pipeline — BM25, TF-IDF+SVD dense retrieval,
-# RRF fusion, the reranker, the metrics — is implemented here on top of numpy.
-#
-# The HTTP sidecar uses the standard library (http.server), and the LLM client
-# uses urllib. That is deliberate: fewer moving parts is what lets this run on
-# a machine with no network and no API key.
+# Everything in `src/raggy/` except `app.py` runs on numpy alone: BM25, the
+# TF-IDF+SVD dense retriever, RRF fusion, the reranker, the metrics, the
+# incremental cache. That keeps `./run.sh demo`, `eval`, `bench` and the test
+# suite dependency-light and offline.
 # ---------------------------------------------------------------------------
 dependencies = [
   "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
-# The real semantic encoder. This is the production path the app switches to
-# automatically when it is installed; without it we fall back to LSA.
-#   uv pip install --python .venv/bin/python sentence-transformers
+# The DESKTOP APP: the Qt editor plus the ONNX encoder runtime.
+#   ./run.sh install
+app = [
+  "PyQt6>=6.6",
+  "PyQt6-QScintilla>=2.14",
+  # ⚠️ Pinned below 1.20 on purpose: 1.20+ wheels are built for macOS 13.4+ and
+  # fail to load on macOS 13.0 with "Symbol not found: to_chars".
+  "onnxruntime>=1.19.2,<1.20",
+  "tokenizers>=0.19",   # reads tokenizer.json without pulling in transformers
+  "certifi",            # CA bundle: python.org builds on macOS have no roots
+]
+
+# The real encoder WITHOUT the GUI (CLI + web UI).
 neural = [
+  "onnxruntime>=1.19.2,<1.20",
+  "tokenizers>=0.19",
+  "certifi",
+]
+
+# The GUI only, for someone who already has the engine installed.
+gui = [
+  "PyQt6>=6.6",
+  "PyQt6-QScintilla>=2.14",
+]
+
+# DEVELOPMENT ONLY: the torch-backed encoder, used to verify that the ONNX
+# embeddings are identical. Never ship this — it is ~10x the size of ONNX.
+neural-torch = [
   "sentence-transformers>=3.0",
 ]
-# Only if you want to run the FastAPI server instead of the stdlib one.
-# The default sidecar needs none of this.
+
+# The stdlib sidecar needs nothing, but this is the production swap.
 serve = [
   "fastapi>=0.115",
   "uvicorn>=0.30",
 ]
+
 dev = [
+  "pyinstaller>=6.0",
   "pytest>=8.0",
 ]
+
+[project.scripts]
+raggyeditor = "raggy.app:main"
 
 [build-system]
 requires = ["hatchling"]

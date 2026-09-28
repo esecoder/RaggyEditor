@@ -21,3 +21,8 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# PyInstaller output
+build/
+dist/
+*.spec.bak

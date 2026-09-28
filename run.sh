@@ -2,15 +2,19 @@
 # =============================================================================
 # RaggyEditor — one entry point.
 #
-#   ./run.sh install         create .venv and install the ONE dependency
-#   ./run.sh serve           start the sidecar + open the editor web UI
+#   ./run.sh install         create .venv with the full app stack (engine + GUI)
+#   ./run.sh install-core    engine only (numpy); CLI/eval, no GUI
+#   ./run.sh install-model   download the ONNX encoder (~133 MB, once)
+#   ./run.sh app             launch the RaggyEditor desktop app
+#   ./run.sh package         freeze into a standalone .app/.exe/AppImage
+#   ./run.sh serve           sidecar + browser editor UI (no Qt needed)
 #   ./run.sh demo            offline demo: index a sample doc, run real searches
 #   ./run.sh search "..."    semantic search from the terminal
 #   ./run.sh ask "..."       cited answer from the terminal (needs a key)
 #   ./run.sh eval            measure semantic vs regex on ground-truth queries
 #   ./run.sh bench           measure what incremental re-indexing saves
 #   ./run.sh test            run the test suite
-#   ./run.sh install-neural  opt in to the real local encoder (bge-small)
+#   ./run.sh install-neural  dev only: torch encoder for comparison (large)
 # =============================================================================
 set -euo pipefail
 
@@ -52,18 +56,49 @@ shift || true
 
 case "$cmd" in
   install)
-    banner "INSTALL — numpy is the only required dependency"
+    banner "INSTALL — RaggyEditor app stack"
     command -v uv >/dev/null 2>&1 || { echo "✗ uv not found. Install: https://docs.astral.sh/uv/"; exit 1; }
     uv venv --python 3.12 .venv
-    uv pip install --python .venv/bin/python numpy
-    echo "✓ Done. Try: ./run.sh demo"
+    # onnxruntime is pinned <1.20: 1.20+ wheels require macOS 13.4+ and fail to
+    # load on macOS 13.0. See README "Platform notes".
+    uv pip install --python .venv/bin/python \
+      "numpy>=2.1" "onnxruntime>=1.19.2,<1.20" "tokenizers>=0.19" "certifi" \
+      "PyQt6>=6.6" "PyQt6-QScintilla>=2.14"
+    echo "✓ Done. Try: ./run.sh demo   (then ./run.sh app for the editor)"
+    ;;
+
+  install-core)
+    banner "INSTALL CORE — engine only (no GUI, no neural runtime)"
+    command -v uv >/dev/null 2>&1 || { echo "✗ uv not found."; exit 1; }
+    uv venv --python 3.12 .venv
+    uv pip install --python .venv/bin/python "numpy>=2.1"
+    echo "✓ Done. ./run.sh demo / search / eval work; ./run.sh app needs install."
+    ;;
+
+  install-model)
+    banner "INSTALL MODEL — download the ONNX encoder (~133 MB, once)"
+    need_py
+    exec "$PY" -m raggy.model_store --download
     ;;
 
   install-neural)
-    banner "INSTALL NEURAL — the real semantic encoder (one-time ~130MB download)"
+    banner "INSTALL NEURAL (dev) — torch-backed sentence-transformers"
+    echo "  ⚠️  This is the DEVELOPMENT comparison path. The shipping path is ONNX,"
+    echo "      which is ~10x smaller. Use it only to compare embeddings."
     need_py
     uv pip install --python "$PY" sentence-transformers
-    echo "✓ Done. RaggyEditor will now use BAAI/bge-small-en-v1.5 automatically."
+    ;;
+
+  app)
+    need_py
+    banner "RAGGYEDITOR — the editor"
+    exec "$PY" -m raggy.app "$@"
+    ;;
+
+  package)
+    banner "PACKAGE — freeze RaggyEditor into a standalone executable"
+    need_py
+    exec bash "$ROOT/scripts/package.sh" "$@"
     ;;
 
   serve)
