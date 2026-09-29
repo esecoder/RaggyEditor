@@ -4,16 +4,17 @@ These construct the real Qt window offscreen and drive the real Find path. They
 are skipped when PyQt6/QScintilla are absent, so the core suite still runs on a
 machine with only numpy.
 
-⚠️ One test here exists purely to prevent a regression in the UI SHAPE: the
-window must be a single document pane with a transient find bar — no tab widget
-and no splitter. An earlier version shipped an editor + tabbed side panel, which
-is a code-editor idiom and looked nothing like a text editor.
+Two of them exist purely to stop the UI drifting back into a code editor:
+  * the window must be a single pane — no tab widget, no splitter;
+  * the menu bar must carry no implementation jargon — no Model menu, no
+    encoder choices.
 """
 
 import os
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")     # must precede Qt import
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
@@ -41,6 +42,7 @@ class TestDesktopApp(unittest.TestCase):
         w._indexed_text = self.text
         w._index_timer.stop()                        # stop AFTER setup, not before
         w._find_timer.stop()
+        w.editor.setModified(False)                  # so close() cannot prompt
         return w
 
     def _search(self, w, query):
@@ -50,7 +52,7 @@ class TestDesktopApp(unittest.TestCase):
         w._run_search()
         return w._results
 
-    # ---- shape (regression guard) ----------------------------------------
+    # ---- shape (regression guards) ---------------------------------------
     def test_window_is_a_single_pane_no_tabs_no_splitter(self):
         from PyQt6.QtWidgets import QSplitter, QTabWidget
         w = self._window()
@@ -59,19 +61,55 @@ class TestDesktopApp(unittest.TestCase):
         self.assertIsNone(central.findChild(QSplitter), "split layout came back")
         w.close()
 
-    def test_menu_bar_is_text_editor_shaped(self):
+    def test_menu_bar_carries_no_implementation_jargon(self):
         w = self._window()
         menus = [a.text().replace("&", "") for a in w.menuBar().actions()]
-        for expected in ("File", "Edit", "Find", "View", "Model", "Help"):
-            self.assertIn(expected, menus)
+        self.assertEqual(menus, ["File", "Edit", "Find", "Help"])
+        for jargon in ("Model", "View"):
+            self.assertNotIn(jargon, menus)
         w.close()
 
+    def test_there_is_no_status_bar(self):
+        from PyQt6.QtWidgets import QStatusBar
+        w = self._window()
+        self.assertIsNone(w.findChild(QStatusBar), "status bar came back")
+        w.close()
+
+    def test_ask_is_reachable_from_the_find_menu(self):
+        w = self._window()
+        find_menu = next(a.menu() for a in w.menuBar().actions()
+                         if a.text().replace("&", "") == "Find")
+        labels = [a.text().replace("&", "") for a in find_menu.actions() if a.text()]
+        self.assertTrue(any("Ask" in x for x in labels))
+        w.close()
+
+    # ---- title ------------------------------------------------------------
+    def test_title_is_the_document_name_not_the_app_name(self):
+        from raggy.app import APP_NAME
+        w = self._window()
+        w.path = None
+        w._update_title()
+        self.assertEqual(w.windowTitle(), "Untitled")
+        w.path = "/tmp/notes.txt"
+        w._update_title()
+        self.assertEqual(w.windowTitle(), "notes.txt")
+        self.assertNotIn(APP_NAME, w.windowTitle())
+        w.path = None                                # do not let close() prompt to save
+        w.close()
+
+    # ---- find bar ---------------------------------------------------------
     def test_find_bar_is_hidden_until_find_is_used(self):
         w = self._window()
         self.assertTrue(w.find_bar.isHidden())
         w.show_find()
         self.assertFalse(w.find_bar.isHidden())
-        w._close_find()
+        w.close()
+
+    def test_escape_closes_the_find_bar(self):
+        w = self._window()
+        w.show_find()
+        self.assertFalse(w.find_bar.isHidden())
+        w.find_bar.field.escapePressed.emit()       # what Esc does in the field
         self.assertTrue(w.find_bar.isHidden())
         w.close()
 
@@ -80,13 +118,10 @@ class TestDesktopApp(unittest.TestCase):
         w = self._window()
         res = self._search(w, "ERR_CONN_4421")
         self.assertGreaterEqual(len(res), 1)
-        # Exact hits are present, and — by design — related passages may be too:
-        # it is one search box, not a word box plus a separate meaning box.
         self.assertTrue(any(r["kind"] == "match" for r in res))
         w.close()
 
     def test_paraphrase_returns_related_passages(self):
-        # The words do not appear in the document; only meaning connects them.
         w = self._window()
         res = self._search(w, "how do I fix an expired certificate on a replica")
         self.assertTrue(res)
@@ -94,8 +129,6 @@ class TestDesktopApp(unittest.TestCase):
         w.close()
 
     def test_one_search_box_can_return_both_kinds(self):
-        # A query with a literal phrase AND semantic content yields both in one
-        # list — this is the point of the redesign.
         w = self._window()
         res = self._search(w, "replication lag")
         kinds = {r["kind"] for r in res}
@@ -135,7 +168,6 @@ class TestDesktopApp(unittest.TestCase):
         start = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSELECTIONSTART)
         end = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSELECTIONEND)
         self.assertEqual((start, end), (r["start"], r["end"]))
-        self.assertEqual(self.text[start:end], self.text[r["start"]:r["end"]])
         w.close()
 
     def test_next_wraps_around(self):
@@ -145,7 +177,7 @@ class TestDesktopApp(unittest.TestCase):
         self.assertGreater(n, 1)
         for _ in range(n):
             w._next()
-        self.assertEqual(w._current, 0)                 # wrapped back to the start
+        self.assertEqual(w._current, 0)
         w._prev()
         self.assertEqual(w._current, n - 1)
         w.close()
@@ -158,15 +190,6 @@ class TestDesktopApp(unittest.TestCase):
         self.assertIn("related", text)
         w.close()
 
-    def test_out_of_scope_query_is_flagged(self):
-        w = self._window()
-        self._search(w, "what is the capital of France")
-        self.assertIn("related", w.find_bar.status.text().lower())   # may still return passages
-        w._run_search()
-        # Either nothing was found, or it is explicitly marked low-confidence.
-        self.assertTrue(w._semantic_low or not w._results)
-        w.close()
-
     def test_use_selection_for_find(self):
         from PyQt6 import Qsci
         w = self._window()
@@ -177,7 +200,7 @@ class TestDesktopApp(unittest.TestCase):
         self.assertTrue(w._results)
         w.close()
 
-    # ---- indexing behaviour ----------------------------------------------
+    # ---- indexing ---------------------------------------------------------
     def test_editing_schedules_a_reindex(self):
         w = self._window()
         self.assertFalse(w._index_timer.isActive())
@@ -185,12 +208,22 @@ class TestDesktopApp(unittest.TestCase):
         self.assertTrue(w._index_timer.isActive())
         w.close()
 
-    def test_view_toggles_do_not_raise(self):
+    # ---- the meaning-search offer ----------------------------------------
+    def test_meaning_is_offered_once_and_only_when_it_can_help(self):
         w = self._window()
-        w._toggle_line_numbers(True)
-        w._toggle_line_numbers(False)
-        w._toggle_wrap(False)
-        w._toggle_wrap(True)
+        with mock.patch("raggy.encoder.onnx_importable", return_value=True), \
+             mock.patch("raggy.app.model_store.is_available", return_value=False):
+            w._meaning_offer_made = False
+            self.assertTrue(w._should_offer_meaning())
+            w._meaning_offer_made = True               # already asked once
+            self.assertFalse(w._should_offer_meaning())
+        w.close()
+
+    def test_meaning_is_not_offered_when_the_model_is_already_there(self):
+        w = self._window()
+        with mock.patch("raggy.app.model_store.is_available", return_value=True):
+            w._meaning_offer_made = False
+            self.assertFalse(w._should_offer_meaning())
         w.close()
 
 

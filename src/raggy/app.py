@@ -2,36 +2,36 @@
 """
 app.py — RaggyEditor, the desktop application.
 
-One document pane. No side panels, no tabs. `Cmd+F` slides a find bar in at the
-top, exactly like TextEdit's — and that one search box answers with BOTH kinds of
-match:
+A plain text editor. One document, one window, a find bar that slides in when
+you ask for it — the way TextEdit works.
 
-  * the word(s) you typed (exact, as any editor finds them), and
-  * the passages that mean the same thing even though they use different words.
-
-They arrive in one navigable list, so there is no separate "semantic find" UI to
-learn. Enter / Shift+Enter (or the chevrons) walk through every match; the
-document highlights them; Done closes the bar.
-
-    Cmd+F   find (exact + related)      Cmd+G / Cmd+Shift+G  next / previous
-    Cmd+E   use selection for find      Cmd+Shift+A          ask the document
-    Esc     close the find bar
+    Cmd+F    find        Cmd+G / Cmd+Shift+G   next / previous
+    Cmd+E    use selection for find
+    Cmd+Shift+A   ask a question about this document
+    Esc      close the find bar
 
 ===============================================================================
-WHAT CHANGED AND WHY
+ONE SEARCH BOX, TWO KINDS OF ANSWER
 ===============================================================================
-The first version split the window into an editor and a tabbed panel with
-permanent Find/Ask tabs. That is a code-editor idiom — it is not what a plain
-text editor looks like, and it made the simple act of searching look like a
-different application. The panel is gone; the search bar is transient.
+The find field returns what every editor returns — the words you typed — AND the
+passages that mean the same thing in different words. They arrive in one
+navigable list, so there is no "semantic mode" to switch to and no second panel.
 
-⚠️ The engine is unchanged. This file is presentation: the same hybrid retrieval,
-the same calibrated abstention, the same incremental index — just surfaced the
-way a text editor's Find should be.
+===============================================================================
+WHAT IS DELIBERATELY NOT HERE
+===============================================================================
+There is no "Model" menu, no encoder picker, no "LSA / ONNX / neural" jargon,
+and no status bar reporting cache statistics. Those are facts about the
+implementation, not about the user's document, and a text editor should not ask
+anyone to choose them.
 
-Run:
-    ./run.sh app
-    python -m raggy.app path/to/file.txt
+⚠️ The one genuinely user-facing need behind all of it — "can this find things by
+meaning?" — is met by a single offer, made exactly once, at the moment it
+matters: when a search finds nothing by exact match. It is also reachable by
+hand from the Help menu as "Enable Search by Meaning…".
+
+The internal names still exist for developers: RAGGY_ENCODER=lsa|onnx|neural,
+and `./run.sh install-model`.
 """
 
 from __future__ import annotations
@@ -45,8 +45,8 @@ from raggy.engine import RaggyEngine
 
 try:
     from PyQt6 import Qsci
-    from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QAction, QFontDatabase, QKeySequence
+    from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
+    from PyQt6.QtGui import QAction, QKeySequence
     from PyQt6.QtWidgets import (
         QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
         QLineEdit, QMainWindow, QMessageBox, QProgressDialog, QToolButton,
@@ -57,13 +57,12 @@ except Exception:                                                   # noqa: BLE0
 
 APP_NAME = "RaggyEditor"
 
-# Scintilla indicator slots used for the two kinds of highlight.
 IND_EXACT = 8
 IND_RELATED = 9
-# Scintilla colours are BGR, not RGB.
-COL_EXACT = 0x40E0FF        # amber  (R=255 G=224 B=64)
-COL_RELATED = 0xFFBE8C      # blue   (R=140 G=190 B=255)
-MAX_EXACT = 2000            # a search for "e" must not freeze the UI
+COL_EXACT = 0x40E0FF        # Scintilla colours are BGR: amber
+COL_RELATED = 0xFFBE8C      # blue
+MAX_EXACT = 2000
+UNTITLED = "Untitled"
 
 
 # =============================================================================
@@ -72,8 +71,6 @@ MAX_EXACT = 2000            # a search for "e" must not freeze the UI
 if HAS_QT:
 
     class Worker(QThread):
-        """Runs one callable off the UI thread and reports result or error."""
-
         done = pyqtSignal(object)
         failed = pyqtSignal(str)
 
@@ -100,10 +97,21 @@ if HAS_QT:
                 self.failed.emit(f"{type(e).__name__}: {e}")
 
     # =========================================================================
-    # THE FIND BAR — the only search UI in the app
+    # FIND BAR
     # =========================================================================
+    class FindField(QLineEdit):
+        """A search field that reports Esc, so the bar can close on it."""
+
+        escapePressed = pyqtSignal()
+
+        def keyPressEvent(self, event):
+            if event.key() == Qt.Key.Key_Escape:
+                self.escapePressed.emit()
+                return
+            super().keyPressEvent(event)
+
     class FindBar(QFrame):
-        """A slim bar that slides in above the document, TextEdit-style."""
+        """The only search UI: a slim bar above the document."""
 
         queryChanged = pyqtSignal(str)
         nextRequested = pyqtSignal()
@@ -114,32 +122,33 @@ if HAS_QT:
             super().__init__()
             self.setFrameShape(QFrame.Shape.NoFrame)
             self.setStyleSheet(
-                "FindBar { background: palette(window); border-bottom: 1px solid "
-                "palette(mid); }")
+                "FindBar { background: palette(window);"
+                " border-bottom: 1px solid palette(mid); }")
 
             row = QHBoxLayout(self)
             row.setContentsMargins(10, 6, 10, 6)
             row.setSpacing(6)
 
-            self.field = QLineEdit()
-            self.field.setPlaceholderText("Find — words, or describe what you mean")
+            self.field = FindField()
+            self.field.setPlaceholderText("Find")
             self.field.setClearButtonEnabled(True)
-            self.field.setMinimumWidth(320)
+            self.field.setMinimumWidth(300)
             self.field.textChanged.connect(self.queryChanged)
             self.field.returnPressed.connect(self._enter)
+            self.field.escapePressed.connect(self.closed)
             row.addWidget(self.field, 1)
 
             self.status = QLabel("")
             self.status.setStyleSheet("color: palette(mid); font-size: 12px;")
             row.addWidget(self.status)
 
-            self.regex_btn = self._toggle(".*", "Treat the query as a regular expression")
             self.case_btn = self._toggle("Aa", "Match case")
-            row.addWidget(self.regex_btn)
+            self.regex_btn = self._toggle(".*", "Regular expression")
             row.addWidget(self.case_btn)
+            row.addWidget(self.regex_btn)
 
-            self.prev_btn = self._button("\u2039", "Previous match", self.prevRequested)
-            self.next_btn = self._button("\u203a", "Next match", self.nextRequested)
+            self.prev_btn = self._chevron("\u2039", "Previous match", self.prevRequested)
+            self.next_btn = self._chevron("\u203a", "Next match", self.nextRequested)
             row.addWidget(self.prev_btn)
             row.addWidget(self.next_btn)
 
@@ -158,17 +167,15 @@ if HAS_QT:
             b.toggled.connect(lambda _: self.queryChanged.emit(self.field.text()))
             return b
 
-        def _button(self, text, tip, signal):
+        def _chevron(self, text, tip, signal):
             b = QToolButton()
             b.setText(text)
             b.setAutoRaise(True)
             b.setToolTip(tip)
-            b.setAutoRaise(True)
             b.clicked.connect(signal)
             return b
 
         def _enter(self):
-            # Shift+Enter walks backwards, like TextEdit.
             if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
                 self.prevRequested.emit()
             else:
@@ -181,13 +188,12 @@ if HAS_QT:
             self.status.setText(text)
 
     # =========================================================================
-    # THE WINDOW — one editor, nothing else
+    # WINDOW
     # =========================================================================
     class MainWindow(QMainWindow):
 
         def __init__(self, path: str | None = None):
             super().__init__()
-            self.setWindowTitle(APP_NAME)
             self.resize(980, 720)
 
             self.engine = RaggyEngine()
@@ -197,6 +203,9 @@ if HAS_QT:
             self._current = 0
             self._semantic_low = False
             self._workers: list[QThread] = []
+            self._settings = QSettings("RaggyEditor", "RaggyEditor")
+            self._meaning_offer_made = bool(
+                self._settings.value("meaning_offer_made", False, type=bool))
 
             self._index_timer = QTimer(self)
             self._index_timer.setSingleShot(True)
@@ -211,26 +220,21 @@ if HAS_QT:
             self._build_ui()
             self._build_menus()
             self._setup_indicators()
+            self._update_title()
 
             if path:
                 self.load_path(path)
-            else:
-                self.statusBar().showMessage(
-                    "Open a file (Cmd+O) or paste text, then press Cmd+F.")
 
         # ------------------------------------------------------------------ UI
         def _build_ui(self):
             self.editor = Qsci.QsciScintilla()
             self.editor.setUtf8(True)
             self.editor.setWrapMode(Qsci.QsciScintilla.WrapMode.WrapWord)
-            self.editor.setCaretLineVisible(False)          # TextEdit has no caret line
-            self.editor.setMarginWidth(0, 0)                # no line numbers by default
-            try:
-                fixed = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
-                fixed.setPointSize(13)
-                self.editor.setFont(fixed)
-            except Exception:                                       # noqa: BLE001
-                pass
+            self.editor.setCaretLineVisible(False)
+            self.editor.setMarginWidth(0, 0)
+            # ⚠️ TextEdit's plain-text default is the PROPORTIONAL system font,
+            # not a fixed-width one. Looking like TextEdit was the explicit ask.
+            self.editor.setFont(QApplication.font())
 
             self.find_bar = FindBar()
             self.find_bar.hide()
@@ -248,9 +252,12 @@ if HAS_QT:
             self.setCentralWidget(central)
 
             self.editor.textChanged.connect(self._on_text_changed)
+            try:
+                self.editor.modificationChanged.connect(self.setWindowModified)
+            except Exception:                                       # noqa: BLE001
+                pass
 
         def _setup_indicators(self):
-            """Two highlight styles: exact matches, and semantically related text."""
             S = Qsci.QsciScintilla
             for ind, colour in ((IND_EXACT, COL_EXACT), (IND_RELATED, COL_RELATED)):
                 try:
@@ -260,7 +267,7 @@ if HAS_QT:
                     self.editor.SendScintilla(S.SCI_INDICSETOUTLINEALPHA, ind, 130)
                     self.editor.SendScintilla(S.SCI_INDICSETUNDER, ind, 0)
                 except Exception:                                   # noqa: BLE001
-                    pass                                            # cosmetic only
+                    pass
 
         def _build_menus(self):
             m = self.menuBar()
@@ -269,6 +276,8 @@ if HAS_QT:
             self._act(f, "&Open…", QKeySequence.StandardKey.Open, self.open_file)
             self._act(f, "&Save", QKeySequence.StandardKey.Save, self.save_file)
             self._act(f, "Save &As…", QKeySequence.StandardKey.SaveAs, self.save_as)
+            f.addSeparator()
+            self._act(f, "&Close", QKeySequence.StandardKey.Close, self.close)
 
             e = m.addMenu("&Edit")
             self._act(e, "&Undo", QKeySequence.StandardKey.Undo, self.editor.undo)
@@ -286,25 +295,13 @@ if HAS_QT:
             self._act(d, "Find &Previous", QKeySequence.StandardKey.FindPrevious, self._prev)
             self._act(d, "Use Selection for Find", "Ctrl+E", self._use_selection)
             d.addSeparator()
-            self._act(d, "&Ask the Document…", "Ctrl+Shift+A", self.ask_document)
-
-            v = m.addMenu("&View")
-            self._line_act = self._act(v, "Show Line Numbers", None,
-                                       self._toggle_line_numbers, checkable=True)
-            self._wrap_act = self._act(v, "Wrap Lines", None, self._toggle_wrap,
-                                       checkable=True)
-            self._wrap_act.setChecked(True)
-
-            mm = m.addMenu("&Model")
-            self._act(mm, "&Download Semantic Model…", None, self.download_model)
-            self._act(mm, "Use &Offline Encoder (LSA)", None, lambda: self._set_encoder("lsa"))
-            self._act(mm, "Use &Semantic Encoder (ONNX)", None, lambda: self._set_encoder("onnx"))
-            self._act(mm, "&Automatic (recommended)", None, lambda: self._set_encoder("auto"))
-            mm.addSeparator()
-            self._act(mm, "Model &Status", None, self.model_status)
+            self._act(d, "&Ask a Question About This Document…", "Ctrl+Shift+A",
+                      self.ask_document)
 
             h = m.addMenu("&Help")
-            self._act(h, "&About", None, self.about)
+            self._act(h, "Enable Search by Meaning…", None, self.enable_meaning_search)
+            h.addSeparator()
+            self._act(h, "&About " + APP_NAME, None, self.about)
 
         def _act(self, menu, text, shortcut, slot, checkable=False):
             a = QAction(text, self)
@@ -315,7 +312,17 @@ if HAS_QT:
             menu.addAction(a)
             return a
 
-        # ------------------------------------------------------------- files
+        # --------------------------------------------------------------- title
+        def _update_title(self):
+            """TextEdit shows the document NAME, not the application name."""
+            name = os.path.basename(self.path) if self.path else UNTITLED
+            self.setWindowTitle(name)
+            try:
+                self.setWindowFilePath(self.path or "")
+            except Exception:                                       # noqa: BLE001
+                pass
+
+        # --------------------------------------------------------------- files
         def open_file(self):
             p, _ = QFileDialog.getOpenFileName(
                 self, "Open", os.path.expanduser("~"),
@@ -332,7 +339,8 @@ if HAS_QT:
                 return
             self.path = path
             self._indexed_text = ""
-            self.setWindowTitle(f"{os.path.basename(path)} — {APP_NAME}")
+            self.editor.setModified(False)
+            self._update_title()
             self._index_document()
             if self.find_bar.isVisible() and self.find_bar.query():
                 self._run_search()
@@ -343,7 +351,7 @@ if HAS_QT:
             try:
                 with open(self.path, "w", encoding="utf-8") as fh:
                     fh.write(self.editor.text())
-                self.statusBar().showMessage(f"Saved {self.path}", 4000)
+                self.editor.setModified(False)
             except Exception as e:                                  # noqa: BLE001
                 QMessageBox.warning(self, APP_NAME, f"Could not save:\n{e}")
 
@@ -352,10 +360,11 @@ if HAS_QT:
                 self, "Save As", os.path.expanduser("~"), "Text files (*.txt);;All files (*)")
             if p:
                 self.path = p
+                self.editor.setModified(True)
                 self.save_file()
-                self.setWindowTitle(f"{os.path.basename(p)} — {APP_NAME}")
+                self._update_title()
 
-        # ----------------------------------------------------------- indexing
+        # ------------------------------------------------------------- indexing
         def _on_text_changed(self):
             self._index_timer.start()
 
@@ -363,32 +372,22 @@ if HAS_QT:
             text = self.editor.text()
             if text == self._indexed_text:
                 return
-            doc = os.path.basename(self.path) if self.path else "untitled"
-            self.statusBar().showMessage("Indexing…")
+            doc = os.path.basename(self.path) if self.path else UNTITLED
             self._run(self.engine.index, text, doc,
-                      on_done=self._indexed, on_fail=lambda m: self.statusBar().showMessage(
-                          "Index failed: " + m, 8000))
+                      on_done=self._indexed,
+                      on_fail=lambda _m: None)     # indexing failure is not fatal
+        # NOTE: no status bar. Indexing is silent unless a search is waiting on
+        # it, in which case the find bar says "Indexing…" (see _update_status).
 
         def _indexed(self, info):
             self._indexed_text = self.editor.text()
-            if info["reencoded_chunks"] == 0:
-                note = f"reused all {info['reused_chunks']}"
-            else:
-                note = f"re-encoded {info['reencoded_chunks']}, reused {info['reused_chunks']}"
-            self.statusBar().showMessage(
-                f"{info['n_chunks']} passages · {note} · {info['index_ms']} ms", 5000)
-            # Semantic results may now exist where there were none.
             if self.find_bar.isVisible() and self.find_bar.query():
                 self._run_search()
 
-        # ------------------------------------------------------------- find
+        # ---------------------------------------------------------------- find
         def _selected_text(self) -> str:
-            """The current selection, read from Scintilla positions.
-
-            ⚠️ Not `editor.selectedText()`: that returns an empty string in some
-            QScintilla builds when the editor does not hold focus, which is
-            exactly the case when the find bar has it.
-            """
+            """Read from Scintilla positions: `selectedText()` is empty when the
+            editor does not hold focus, which is exactly when the bar has it."""
             S = Qsci.QsciScintilla
             try:
                 a = self.editor.SendScintilla(S.SCI_GETSELECTIONSTART)
@@ -437,21 +436,23 @@ if HAS_QT:
 
             exact = self._exact_matches(query)
             if exact is None:
-                # Bad regex. The message is already on the bar; do not overwrite
-                # it with "No matches" — that would hide the actual problem.
-                return
+                return                          # bad regex; message already shown
             related = self._related_passages(query)
-
             seen = {(r["start"], r["end"]) for r in exact}
-            self._results = exact + [r for r in related if (r["start"], r["end"]) not in seen]
+            self._results = exact + [r for r in related
+                                     if (r["start"], r["end"]) not in seen]
 
             self._highlight()
             self._update_status()
             if self._results:
                 self._select_current()
 
+            # The one moment worth mentioning meaning-search: you asked for
+            # something, and by exact match alone, this document has nothing.
+            if not exact and self._should_offer_meaning():
+                self._offer_meaning_search()
+
         def _exact_matches(self, query: str) -> list[dict] | None:
-            """The ordinary Find: the words you typed, matched literally (or as regex)."""
             flags = 0 if self.find_bar.case_btn.isChecked() else re.IGNORECASE
             pattern = query if self.find_bar.regex_btn.isChecked() else re.escape(query)
             try:
@@ -468,12 +469,6 @@ if HAS_QT:
             return out
 
         def _related_passages(self, query: str) -> list[dict]:
-            """Passages that mean the same thing, via the RAG engine.
-
-            ⚠️ These are what a word search cannot find, and they are returned in
-            the SAME list as the word matches — that is the whole point of the
-            redesign: one search box, two kinds of answer.
-            """
             if not self._indexed_text or not self.engine.is_indexed:
                 return []
             try:
@@ -481,10 +476,8 @@ if HAS_QT:
             except Exception:                                       # noqa: BLE001
                 return []
             self._semantic_low = bool(res.get("low_confidence"))
-            out = []
-            for h in res.get("results", []):
-                out.append({"kind": "related", "start": h["start"], "end": h["end"]})
-            return out
+            return [{"kind": "related", "start": h["start"], "end": h["end"]}
+                    for h in res.get("results", [])]
 
         # -------------------------------------------------------- highlighting
         def _clear_indicators(self):
@@ -511,12 +504,12 @@ if HAS_QT:
         def _update_status(self):
             n = len(self._results)
             if not n:
-                msg = "No matches"
-                if self._semantic_low:
-                    msg += " · nothing here looks related"
-                elif not self._indexed_text:
-                    msg = "Indexing…"
-                self.find_bar.set_status(msg)
+                if not self._indexed_text:
+                    self.find_bar.set_status("Indexing…")
+                elif self._semantic_low:
+                    self.find_bar.set_status("No matches")
+                else:
+                    self.find_bar.set_status("No matches")
                 return
             exact = sum(1 for r in self._results if r["kind"] == "match")
             related = n - exact
@@ -529,7 +522,7 @@ if HAS_QT:
                 parts.append(f"{exact} matches")
             self.find_bar.set_status("  ·  ".join(parts))
 
-        # -------------------------------------------------------- navigation
+        # ---------------------------------------------------------- navigation
         def _select_current(self):
             if not self._results:
                 return
@@ -557,52 +550,33 @@ if HAS_QT:
             self._current = (self._current - 1) % len(self._results)
             self._select_current()
 
-        # -------------------------------------------------------------- ask
-        def ask_document(self):
-            question, ok = QInputDialog.getText(
-                self, "Ask the Document",
-                "Ask a question about this document:")
-            if not ok or not question.strip():
-                return
-            if not self._indexed_text:
-                self.statusBar().showMessage("Indexing — try again in a moment.", 6000)
-                self._index_document()
-                return
-            self.statusBar().showMessage("Thinking…")
-            self._run(self.engine.ask, question.strip(),
-                      on_done=self._show_answer,
-                      on_fail=lambda m: QMessageBox.warning(self, APP_NAME, m))
+        # ------------------------------------------------- meaning search offer
+        def _should_offer_meaning(self) -> bool:
+            """Offer the download once, only when it would actually help."""
+            if self._meaning_offer_made or model_store.is_available():
+                return False
+            from raggy.encoder import onnx_importable
+            return bool(onnx_importable())
 
-        def _show_answer(self, data):
-            mode = data.get("mode")
-            if mode == "abstained":
-                body = (f"This document does not appear to contain the answer.\n\n"
-                        f"({data.get('reason')})\n\n"
-                        "RaggyEditor refuses rather than guessing.")
-            elif mode == "retrieval_only":
-                body = (f"{data.get('reason')}\n\n"
-                        "Set OPENAI_API_KEY to enable generated answers. DeepSeek works "
-                        "unchanged — it is OpenAI-compatible for chat.")
-            else:
-                body = data.get("answer") or ""
-                cites = data.get("citations") or []
-                used = data.get("cited") or []
-                if used:
-                    body += "\n\nSources:"
-                    for i in used:
-                        c = cites[i]
-                        body += f"\n  [{i + 1}] line {c['line']}: " + " ".join(c["text"].split())[:70]
-            self.statusBar().clearMessage()
-            QMessageBox.information(self, "Ask the Document", body)
+        def _offer_meaning_search(self):
+            self._meaning_offer_made = True
+            self._settings.setValue("meaning_offer_made", True)
+            r = QMessageBox.question(
+                self, "Search by Meaning",
+                "No exact matches.\n\n"
+                "RaggyEditor can also find passages that mean the same thing in "
+                "different words. That needs a one-time download (about 133 MB).\n\n"
+                "Download it now?")
+            if r == QMessageBox.StandardButton.Yes:
+                self.enable_meaning_search()
 
-        # ------------------------------------------------------------ model
-        def download_model(self):
+        def enable_meaning_search(self):
             if model_store.is_available():
-                self.model_status()
+                self._set_encoder("onnx")
                 return
             self.progress = QProgressDialog(
-                "Downloading the semantic model (~133 MB)…", "Cancel", 0, 100, self)
-            self.progress.setWindowTitle(APP_NAME)
+                "Downloading (about 133 MB)…", "Cancel", 0, 100, self)
+            self.progress.setWindowTitle("Search by Meaning")
             self.progress.setMinimumDuration(0)
             w = DownloadWorker()
             w.progress.connect(self._download_progress)
@@ -615,7 +589,7 @@ if HAS_QT:
             if total and getattr(self, "progress", None):
                 self.progress.setValue(int(100 * got / total))
 
-        def _download_done(self, path: str):
+        def _download_done(self, _path: str):
             if getattr(self, "progress", None):
                 self.progress.close()
             self._set_encoder("onnx")
@@ -623,17 +597,9 @@ if HAS_QT:
         def _download_failed(self, msg: str):
             if getattr(self, "progress", None):
                 self.progress.close()
-            QMessageBox.warning(self, APP_NAME, f"Download failed:\n{msg}")
-
-        def model_status(self):
-            from raggy.encoder import onnx_importable
-            active = self.engine.encoder.name if self.engine.encoder else "not indexed yet"
-            QMessageBox.information(self, f"{APP_NAME} — Model", "\n".join([
-                f"ONNX runtime available : {'yes' if onnx_importable() else 'no'}",
-                f"Model downloaded       : {'yes' if model_store.is_available() else 'no'}",
-                f"Active encoder         : {active}",
-                f"Location               : {model_store.model_dir()}",
-            ]))
+            QMessageBox.warning(self, APP_NAME,
+                                f"Could not download:\n{msg}\n\n"
+                                "The editor still works — exact search is unaffected.")
 
         def _set_encoder(self, kind: str):
             self.engine._encoder_kind = kind
@@ -641,25 +607,48 @@ if HAS_QT:
             self._indexed_text = ""
             self._index_document()
 
-        # -------------------------------------------------------- view toggles
-        def _toggle_line_numbers(self, on: bool):
-            try:
-                m = getattr(Qsci.QsciScintilla, "MarginType", None)
-                kind = m.NumberMargin if m is not None else Qsci.QsciScintilla.NumberMargin
-                self.editor.setMarginType(0, kind)
-                self.editor.setMarginWidth(0, "0000" if on else 0)
-            except Exception:                                       # noqa: BLE001
-                pass
+        # ----------------------------------------------------------------- ask
+        def ask_document(self):
+            question, ok = QInputDialog.getText(
+                self, "Ask About This Document", "Your question:")
+            if not ok or not question.strip():
+                return
+            self._run(self.engine.ask, question.strip(),
+                      on_done=self._show_answer,
+                      on_fail=lambda m: QMessageBox.warning(self, APP_NAME, m))
 
-        def _toggle_wrap(self, on: bool):
-            try:
-                mode = (Qsci.QsciScintilla.WrapMode.WrapWord if on
-                        else Qsci.QsciScintilla.WrapMode.WrapNone)
-                self.editor.setWrapMode(mode)
-            except Exception:                                       # noqa: BLE001
-                pass
+        def _show_answer(self, data):
+            mode = data.get("mode")
+            if mode == "abstained":
+                body = ("This document does not appear to contain the answer.\n\n"
+                        "RaggyEditor says so rather than guessing.")
+            elif mode == "retrieval_only":
+                body = ("No answer can be generated without an API key, so here is what "
+                        "the document does say — use Find to see the passages.\n\n"
+                        "To enable written answers, add your key to the project's .env "
+                        "file (DeepSeek works unchanged).")
+            else:
+                body = data.get("answer") or ""
+                cites = data.get("citations") or []
+                used = data.get("cited") or []
+                if used:
+                    body += "\n\nFrom:"
+                    for i in used:
+                        c = cites[i]
+                        body += ("\n  line " + str(c["line"]) + ": "
+                                 + " ".join(c["text"].split())[:70])
+            QMessageBox.information(self, "Answer", body)
 
-        # ------------------------------------------------------------ helpers
+        # --------------------------------------------------------------- about
+        def about(self):
+            QMessageBox.about(self, f"About {APP_NAME}", (
+                f"<b>{APP_NAME}</b><br><br>"
+                "A plain text editor that can find passages by meaning, as well as "
+                "by the exact words you type.<br><br>"
+                "Free software under the GNU General Public License v3.<br>"
+                "Editing engine: Scintilla."))
+
+        # ------------------------------------------------------------- helpers
         def _run(self, fn, *args, on_done, on_fail):
             w = Worker(fn, *args)
             w.done.connect(on_done)
@@ -672,22 +661,20 @@ if HAS_QT:
             w.finished.connect(
                 lambda: self._workers.remove(w) if w in self._workers else None)
 
-        def about(self):
-            QMessageBox.about(self, f"About {APP_NAME}", (
-                f"<b>{APP_NAME}</b> — a text editor whose Find works by meaning.<br><br>"
-                "Editing engine: QScintilla (the text engine behind Notepad++ and SciTE).<br>"
-                "One search box returns word matches and related passages together.<br><br>"
-                "Runs fully offline. The semantic model is downloaded once, on request.<br>"
-                "Licensed GPLv3 (QScintilla and PyQt6 are GPLv3)."))
-
         def closeEvent(self, event):
             if self.editor.isModified() and self.path:
-                r = QMessageBox.question(self, APP_NAME, "Save changes before closing?")
-                if r == QMessageBox.StandardButton.Yes:
+                r = QMessageBox.question(self, APP_NAME, "Save changes before closing?",
+                                         QMessageBox.StandardButton.Save
+                                         | QMessageBox.StandardButton.Discard
+                                         | QMessageBox.StandardButton.Cancel)
+                if r == QMessageBox.StandardButton.Save:
                     self.save_file()
+                elif r == QMessageBox.StandardButton.Cancel:
+                    event.ignore()
+                    return
             event.accept()
 
-else:  # pragma: no cover - only when Qt is missing
+else:  # pragma: no cover
 
     class MainWindow:  # type: ignore
         pass

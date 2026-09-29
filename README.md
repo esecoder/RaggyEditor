@@ -30,9 +30,26 @@ Cmd+F  "how do I fix an expired certificate on a replica"
 It runs **fully offline** with no API key, ships as a **single downloadable
 app**, and fetches its embedding model once, on request.
 
-**Ask the Document** (`Cmd+Shift+A`) is there too, but as a menu command that
-opens a dialog — not a permanent pane. It answers with citations, or refuses
-when the answer is not in the document.
+**Ask a Question About This Document…** (`Cmd+Shift+A`, under the Find menu) is
+there too, but as a menu command that opens a dialog — not a permanent pane. It
+retrieves the relevant passages and writes a cited answer through an
+OpenAI-compatible key (DeepSeek works unchanged); with no key it shows the
+passages instead of inventing prose, and it refuses when the answer is not in the
+document.
+
+### What is deliberately *not* in the UI
+
+A text editor should not ask you to make decisions about its implementation. So:
+
+| Not there | Why |
+|---|---|
+| Model / encoder menu (`ONNX`, `LSA`, `neural`) | Implementation words. The app picks the encoder itself. |
+| "Download model" menu item | Replaced by a single offer, made once, at the moment a search finds nothing exactly. |
+| Status bar ("re-encoded 1, reused 19 · 12 ms") | Cache statistics are not facts about your document. |
+| Line-number gutter, wrap toggle | TextEdit has neither; wrap is always on. |
+
+The escape hatches still exist for developers: `RAGGY_ENCODER=lsa|onnx|neural`
+and `./run.sh install-model`.
 
 ---
 
@@ -85,8 +102,10 @@ upgrade, never a prerequisite.
                             # Linux   -> dist/RaggyEditor/RaggyEditor
 ```
 
-Double-click, then **Model ▸ Download semantic model…** once. Semantic search
-and Ask are ready.
+Double-click and start typing. Find works immediately. The first time a search
+matches nothing exactly, the app offers — once — to download the language model
+(~133 MB) that lets it also find passages by meaning. You can also trigger it
+from **Help ▸ Enable Search by Meaning…**.
 
 > ⚠️ The build is **unsigned**, so macOS Gatekeeper and Windows SmartScreen will
 > warn on first launch (right-click ▸ Open on macOS). See **Shipping** below.
@@ -97,7 +116,7 @@ and Ask are ready.
 ./run.sh install      # .venv with the full app stack (engine + GUI + ONNX)
 ./run.sh app          # launch the editor
 ./run.sh demo         # offline engine tour — no GUI, no model, no key
-./run.sh test         # 74 tests
+./run.sh test         # 78 tests
 ```
 
 ### Just the engine, no Qt
@@ -263,7 +282,7 @@ answer.
 
 ## Verified / not verified
 
-✅ **74 tests pass** (`./run.sh test`), hermetic — no network, no model download.
+✅ **78 tests pass** (`./run.sh test`), hermetic — no network, no model download.
 ✅ The offset invariant (`chunk.text == document[start:end]`) is asserted in the
 chunker **and** tested for every strategy, so highlight-jump cannot drift.
 ✅ **The GUI is tested headlessly** (`tests/test_app.py`): the single-pane layout

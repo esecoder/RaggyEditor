@@ -82,6 +82,6 @@ if [ "$(uname -s)" = "Darwin" ] && [ "$MAKE_DMG" = "1" ]; then
 fi
 
 echo
-echo "  Note: the semantic model is downloaded on first use (Menu ▸ Model ▸"
-echo "  Download semantic model…). Without it the app still searches, using the"
-echo "  offline LSA encoder."
+echo "  Note: the app works immediately. The language model that enables search by"
+echo "  meaning is offered once, in-app, when a search finds no exact match — or"
+echo "  on demand from Help ▸ Enable Search by Meaning…"
