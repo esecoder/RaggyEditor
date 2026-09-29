@@ -5,10 +5,11 @@ app.py — RaggyEditor, the desktop application.
 A plain text editor. One document, one window, a find bar that slides in when
 you ask for it — the way TextEdit works.
 
-    Cmd+F    find        Cmd+G / Cmd+Shift+G   next / previous
-    Cmd+E    use selection for find
+    Cmd+N    new document
+    Cmd+O    open           Cmd+S    save          Cmd+Shift+S  save as
+    Cmd+F    find           Cmd+G / Cmd+Shift+G    next / previous
+    Cmd+E    use selection for find        Esc      close the find bar
     Cmd+Shift+A   ask a question about this document
-    Esc      close the find bar
 
 ===============================================================================
 ONE SEARCH BOX, TWO KINDS OF ANSWER
@@ -20,18 +21,16 @@ navigable list, so there is no "semantic mode" to switch to and no second panel.
 ===============================================================================
 WHAT IS DELIBERATELY NOT HERE
 ===============================================================================
-There is no "Model" menu, no encoder picker, no "LSA / ONNX / neural" jargon,
-and no status bar reporting cache statistics. Those are facts about the
-implementation, not about the user's document, and a text editor should not ask
-anyone to choose them.
+No "Model" menu, no encoder picker, no "LSA / ONNX / neural" jargon, no status
+bar reporting cache statistics, no line-number gutter. Those are facts about the
+implementation, not about the user's document.
 
-⚠️ The one genuinely user-facing need behind all of it — "can this find things by
-meaning?" — is met by a single offer, made exactly once, at the moment it
-matters: when a search finds nothing by exact match. It is also reachable by
-hand from the Help menu as "Enable Search by Meaning…".
+⚠️ The one user-facing need behind them — "can this find things by meaning?" — is
+met by a single offer, made once, at the moment it matters: when a search finds
+nothing by exact match. Also reachable as Help ▸ Enable Search by Meaning…
 
-The internal names still exist for developers: RAGGY_ENCODER=lsa|onnx|neural,
-and `./run.sh install-model`.
+Internal names remain for developers: RAGGY_ENCODER=lsa|onnx|neural,
+./run.sh install-model.
 """
 
 from __future__ import annotations
@@ -48,9 +47,9 @@ try:
     from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
     from PyQt6.QtGui import QAction, QKeySequence
     from PyQt6.QtWidgets import (
-        QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
-        QLineEdit, QMainWindow, QMessageBox, QProgressDialog, QToolButton,
-        QVBoxLayout, QWidget)
+        QApplication, QDialog, QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout,
+        QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+        QProgressDialog, QPushButton, QToolButton, QVBoxLayout, QWidget)
     HAS_QT = True
 except Exception:                                                   # noqa: BLE001
     HAS_QT = False
@@ -63,6 +62,8 @@ COL_EXACT = 0x40E0FF        # Scintilla colours are BGR: amber
 COL_RELATED = 0xFFBE8C      # blue
 MAX_EXACT = 2000
 UNTITLED = "Untitled"
+
+FIND_PLACEHOLDER = "Find — words, or describe what you mean"
 
 
 # =============================================================================
@@ -95,6 +96,69 @@ if HAS_QT:
                     progress=lambda _n, got, total: self.progress.emit(got, total))))
             except Exception as e:                                  # noqa: BLE001
                 self.failed.emit(f"{type(e).__name__}: {e}")
+
+    # =========================================================================
+    # ASK DIALOG
+    # =========================================================================
+    class AskDialog(QDialog):
+        """A question box and a large, resizable answer area.
+
+        ⚠️ A QMessageBox is the obvious choice and the wrong one: it sizes itself
+        to its content, so a long cited answer arrives in a cramped box. This is
+        a real window the user can resize and read.
+        """
+
+        asked = pyqtSignal(str)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Ask About This Document")
+            self.setMinimumSize(680, 480)
+            self.resize(760, 560)
+
+            lay = QVBoxLayout(self)
+            lay.setSpacing(8)
+
+            row = QHBoxLayout()
+            self.question = QLineEdit()
+            self.question.setPlaceholderText("Your question")
+            self.question.returnPressed.connect(self._emit)
+            self.ask_btn = QPushButton("Ask")
+            self.ask_btn.setDefault(True)
+            self.ask_btn.clicked.connect(self._emit)
+            row.addWidget(self.question, 1)
+            row.addWidget(self.ask_btn)
+            lay.addLayout(row)
+
+            self.answer = QPlainTextEdit()
+            self.answer.setReadOnly(True)
+            self.answer.setPlaceholderText(
+                "The answer, with the lines it came from. If the document does not "
+                "contain the answer, it will say so instead of guessing.")
+            lay.addWidget(self.answer, 1)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            buttons.rejected.connect(self.reject)
+            lay.addWidget(buttons)
+
+        def _emit(self):
+            q = self.question.text().strip()
+            if q:
+                self.asked.emit(q)
+
+        def start(self, question: str):
+            self.question.setText(question)
+            self.set_busy(True)
+
+        def set_busy(self, busy: bool):
+            self.ask_btn.setEnabled(not busy)
+            self.ask_btn.setText("Asking…" if busy else "Ask")
+            if busy:
+                self.answer.setPlainText("Looking through the document…")
+
+        def show_answer(self, text: str):
+            self.set_busy(False)
+            self.answer.setPlainText(text)
 
     # =========================================================================
     # FIND BAR
@@ -130,7 +194,7 @@ if HAS_QT:
             row.setSpacing(6)
 
             self.field = FindField()
-            self.field.setPlaceholderText("Find")
+            self.field.setPlaceholderText(FIND_PLACEHOLDER)
             self.field.setClearButtonEnabled(True)
             self.field.setMinimumWidth(300)
             self.field.textChanged.connect(self.queryChanged)
@@ -203,6 +267,7 @@ if HAS_QT:
             self._current = 0
             self._semantic_low = False
             self._workers: list[QThread] = []
+            self._ask_dialog: AskDialog | None = None
             self._settings = QSettings("RaggyEditor", "RaggyEditor")
             self._meaning_offer_made = bool(
                 self._settings.value("meaning_offer_made", False, type=bool))
@@ -231,9 +296,23 @@ if HAS_QT:
             self.editor.setUtf8(True)
             self.editor.setWrapMode(Qsci.QsciScintilla.WrapMode.WrapWord)
             self.editor.setCaretLineVisible(False)
-            self.editor.setMarginWidth(0, 0)
-            # ⚠️ TextEdit's plain-text default is the PROPORTIONAL system font,
-            # not a fixed-width one. Looking like TextEdit was the explicit ask.
+
+            # ⚠️ Zero ALL THREE margins. Setting margin 0 to zero is not enough:
+            # QScintilla gives margin 1 (the symbol/bookmark margin) a default
+            # width of 16px, which shows up as a grey gutter down the left edge.
+            # It is width 0, not "not drawn", so it has to be set explicitly.
+            for m in (0, 1, 2):
+                self.editor.setMarginWidth(m, 0)
+            try:
+                # Breathing room around the text, as TextEdit has. Left and right
+                # are set together so the text block is not visibly off-centre.
+                self.editor.SendScintilla(Qsci.QsciScintilla.SCI_SETMARGINLEFT, 0, 8)
+                self.editor.SendScintilla(Qsci.QsciScintilla.SCI_SETMARGINRIGHT, 0, 8)
+            except Exception:                                       # noqa: BLE001
+                pass
+
+            # The system font, at the system size — whatever the platform calls
+            # "default". On macOS this is the proportional UI font TextEdit uses.
             self.editor.setFont(QApplication.font())
 
             self.find_bar = FindBar()
@@ -273,7 +352,9 @@ if HAS_QT:
             m = self.menuBar()
 
             f = m.addMenu("&File")
+            self._act(f, "&New", QKeySequence.StandardKey.New, self.new_file)
             self._act(f, "&Open…", QKeySequence.StandardKey.Open, self.open_file)
+            f.addSeparator()
             self._act(f, "&Save", QKeySequence.StandardKey.Save, self.save_file)
             self._act(f, "Save &As…", QKeySequence.StandardKey.SaveAs, self.save_as)
             f.addSeparator()
@@ -314,16 +395,48 @@ if HAS_QT:
 
         # --------------------------------------------------------------- title
         def _update_title(self):
-            """TextEdit shows the document NAME, not the application name."""
+            """TextEdit shows the document NAME, not the application name.
+
+            ⚠️ The `[*]` placeholder is required, not cosmetic: Qt substitutes it
+            with the modified marker (the dot in the close button on macOS), and
+            `setWindowModified()` silently does nothing without it — Qt warns
+            "The window title does not contain a '[*]' placeholder" and the user
+            gets no unsaved-changes indicator.
+            """
             name = os.path.basename(self.path) if self.path else UNTITLED
-            self.setWindowTitle(name)
+            self.setWindowTitle(name + "[*]")
             try:
                 self.setWindowFilePath(self.path or "")
             except Exception:                                       # noqa: BLE001
                 pass
 
         # --------------------------------------------------------------- files
+        def _confirm_discard(self) -> bool:
+            """Ask about unsaved changes. True means 'go ahead'."""
+            if not self.editor.isModified():
+                return True
+            r = QMessageBox.question(
+                self, APP_NAME, "Save changes before continuing?",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel)
+            if r == QMessageBox.StandardButton.Save:
+                return self.save_file()          # may have been cancelled in Save As
+            return r == QMessageBox.StandardButton.Discard
+
+        def new_file(self):
+            if not self._confirm_discard():
+                return
+            self.path = None
+            self._indexed_text = ""
+            self.editor.setText("")
+            self.editor.setModified(False)
+            self._update_title()
+            self._close_find()
+            self.editor.setFocus()
+
         def open_file(self):
+            if not self._confirm_discard():
+                return
             p, _ = QFileDialog.getOpenFileName(
                 self, "Open", os.path.expanduser("~"),
                 "Text files (*.txt *.md *.log *.csv *.json);;All files (*)")
@@ -345,24 +458,29 @@ if HAS_QT:
             if self.find_bar.isVisible() and self.find_bar.query():
                 self._run_search()
 
-        def save_file(self):
+        def save_file(self) -> bool:
             if not self.path:
                 return self.save_as()
             try:
                 with open(self.path, "w", encoding="utf-8") as fh:
                     fh.write(self.editor.text())
-                self.editor.setModified(False)
             except Exception as e:                                  # noqa: BLE001
                 QMessageBox.warning(self, APP_NAME, f"Could not save:\n{e}")
+                return False
+            self.editor.setModified(False)
+            return True
 
-        def save_as(self):
+        def save_as(self) -> bool:
             p, _ = QFileDialog.getSaveFileName(
                 self, "Save As", os.path.expanduser("~"), "Text files (*.txt);;All files (*)")
-            if p:
-                self.path = p
-                self.editor.setModified(True)
-                self.save_file()
+            if not p:
+                return False
+            self.path = p
+            self.editor.setModified(True)
+            ok = self.save_file()
+            if ok:
                 self._update_title()
+            return ok
 
         # ------------------------------------------------------------- indexing
         def _on_text_changed(self):
@@ -376,10 +494,8 @@ if HAS_QT:
             self._run(self.engine.index, text, doc,
                       on_done=self._indexed,
                       on_fail=lambda _m: None)     # indexing failure is not fatal
-        # NOTE: no status bar. Indexing is silent unless a search is waiting on
-        # it, in which case the find bar says "Indexing…" (see _update_status).
 
-        def _indexed(self, info):
+        def _indexed(self, _info):
             self._indexed_text = self.editor.text()
             if self.find_bar.isVisible() and self.find_bar.query():
                 self._run_search()
@@ -504,12 +620,8 @@ if HAS_QT:
         def _update_status(self):
             n = len(self._results)
             if not n:
-                if not self._indexed_text:
-                    self.find_bar.set_status("Indexing…")
-                elif self._semantic_low:
-                    self.find_bar.set_status("No matches")
-                else:
-                    self.find_bar.set_status("No matches")
+                self.find_bar.set_status(
+                    "Indexing…" if not self._indexed_text else "No matches")
                 return
             exact = sum(1 for r in self._results if r["kind"] == "match")
             related = n - exact
@@ -609,35 +721,52 @@ if HAS_QT:
 
         # ----------------------------------------------------------------- ask
         def ask_document(self):
-            question, ok = QInputDialog.getText(
-                self, "Ask About This Document", "Your question:")
-            if not ok or not question.strip():
-                return
-            self._run(self.engine.ask, question.strip(),
-                      on_done=self._show_answer,
-                      on_fail=lambda m: QMessageBox.warning(self, APP_NAME, m))
+            if self._ask_dialog is None:
+                self._ask_dialog = AskDialog(self)
+                self._ask_dialog.asked.connect(self._ask)
+            self._ask_dialog.show()
+            self._ask_dialog.raise_()
+            self._ask_dialog.activateWindow()
+            self._ask_dialog.question.setFocus()
 
-        def _show_answer(self, data):
+        def _ask(self, question: str):
+            dlg = self._ask_dialog
+            if dlg:
+                dlg.start(question)
+            self._run(self.engine.ask, question,
+                      on_done=self._answered,
+                      on_fail=self._ask_failed)
+
+        def _answered(self, data):
+            if self._ask_dialog:
+                self._ask_dialog.show_answer(self._format_answer(data))
+
+        def _ask_failed(self, msg: str):
+            if self._ask_dialog:
+                self._ask_dialog.show_answer(f"Something went wrong:\n\n{msg}")
+
+        @staticmethod
+        def _format_answer(data) -> str:
             mode = data.get("mode")
             if mode == "abstained":
-                body = ("This document does not appear to contain the answer.\n\n"
+                return ("This document does not appear to contain the answer.\n\n"
                         "RaggyEditor says so rather than guessing.")
-            elif mode == "retrieval_only":
-                body = ("No answer can be generated without an API key, so here is what "
-                        "the document does say — use Find to see the passages.\n\n"
+            if mode == "retrieval_only":
+                return ("No answer can be written without an API key, so here are the "
+                        "relevant passages — press Cmd+F and search for the topic to "
+                        "see them highlighted.\n\n"
                         "To enable written answers, add your key to the project's .env "
-                        "file (DeepSeek works unchanged).")
-            else:
-                body = data.get("answer") or ""
-                cites = data.get("citations") or []
-                used = data.get("cited") or []
-                if used:
-                    body += "\n\nFrom:"
-                    for i in used:
-                        c = cites[i]
-                        body += ("\n  line " + str(c["line"]) + ": "
-                                 + " ".join(c["text"].split())[:70])
-            QMessageBox.information(self, "Answer", body)
+                        "file. DeepSeek works unchanged.")
+            body = data.get("answer") or ""
+            cites = data.get("citations") or []
+            used = data.get("cited") or []
+            if used:
+                body += "\n\nFrom the document:"
+                for i in used:
+                    c = cites[i]
+                    body += ("\n  line " + str(c["line"]) + ": "
+                             + " ".join(c["text"].split())[:72])
+            return body
 
         # --------------------------------------------------------------- about
         def about(self):
@@ -662,17 +791,10 @@ if HAS_QT:
                 lambda: self._workers.remove(w) if w in self._workers else None)
 
         def closeEvent(self, event):
-            if self.editor.isModified() and self.path:
-                r = QMessageBox.question(self, APP_NAME, "Save changes before closing?",
-                                         QMessageBox.StandardButton.Save
-                                         | QMessageBox.StandardButton.Discard
-                                         | QMessageBox.StandardButton.Cancel)
-                if r == QMessageBox.StandardButton.Save:
-                    self.save_file()
-                elif r == QMessageBox.StandardButton.Cancel:
-                    event.ignore()
-                    return
-            event.accept()
+            if self._confirm_discard():
+                event.accept()
+            else:
+                event.ignore()
 
 else:  # pragma: no cover
 
@@ -680,6 +802,9 @@ else:  # pragma: no cover
         pass
 
     class FindBar:  # type: ignore
+        pass
+
+    class AskDialog:  # type: ignore
         pass
 
 

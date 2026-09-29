@@ -89,10 +89,12 @@ class TestDesktopApp(unittest.TestCase):
         w = self._window()
         w.path = None
         w._update_title()
-        self.assertEqual(w.windowTitle(), "Untitled")
+        # Qt's [*] placeholder must be present for the unsaved-changes marker.
+        self.assertTrue(w.windowTitle().endswith("[*]"))
+        self.assertEqual(w.windowTitle().replace("[*]", ""), "Untitled")
         w.path = "/tmp/notes.txt"
         w._update_title()
-        self.assertEqual(w.windowTitle(), "notes.txt")
+        self.assertEqual(w.windowTitle().replace("[*]", ""), "notes.txt")
         self.assertNotIn(APP_NAME, w.windowTitle())
         w.path = None                                # do not let close() prompt to save
         w.close()
@@ -206,6 +208,20 @@ class TestDesktopApp(unittest.TestCase):
         self.assertFalse(w._index_timer.isActive())
         w.editor.setText(self.text + "\nA new final line.\n")
         self.assertTrue(w._index_timer.isActive())
+        w.editor.setModified(False)      # close() would otherwise prompt to save
+        w.close()
+
+    def test_closing_an_edited_document_asks_about_unsaved_changes(self):
+        # TextEdit prompts even for an untitled document, so we must too.
+        from PyQt6.QtWidgets import QMessageBox
+        w = self._window()
+        w.path = None
+        w.editor.setText("edited")
+        self.assertTrue(w.editor.isModified())
+        with mock.patch("raggy.app.QMessageBox.question",
+                        return_value=QMessageBox.StandardButton.Discard):
+            self.assertTrue(w._confirm_discard())
+        w.editor.setModified(False)
         w.close()
 
     # ---- the meaning-search offer ----------------------------------------
@@ -225,6 +241,122 @@ class TestDesktopApp(unittest.TestCase):
             w._meaning_offer_made = False
             self.assertFalse(w._should_offer_meaning())
         w.close()
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestTextEditDetails(unittest.TestCase):
+    """The small things that make it look like a macOS text editor."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self):
+        from raggy.app import MainWindow
+        w = MainWindow()
+        w._index_timer.stop()
+        w._find_timer.stop()
+        w.editor.setModified(False)
+        return w
+
+    def test_no_left_gutter_at_all(self):
+        # ⚠️ Margin 0 is not the only one: margin 1 (the symbol margin) defaults
+        # to 16px, which is the grey strip that appears down the left edge.
+        w = self._window()
+        for m in (0, 1, 2):
+            self.assertEqual(w.editor.marginWidth(m), 0, f"margin {m} is visible")
+        w.close()
+
+    def test_find_field_placeholder_describes_what_find_can_do(self):
+        from raggy.app import FIND_PLACEHOLDER
+        w = self._window()
+        self.assertEqual(w.find_bar.field.placeholderText(), FIND_PLACEHOLDER)
+        self.assertIn("words", FIND_PLACEHOLDER.lower())
+        self.assertIn("mean", FIND_PLACEHOLDER.lower())
+        w.close()
+
+    def test_file_menu_has_new(self):
+        w = self._window()
+        file_menu = next(a.menu() for a in w.menuBar().actions()
+                         if a.text().replace("&", "") == "File")
+        labels = [a.text().replace("&", "") for a in file_menu.actions() if a.text()]
+        self.assertIn("New", labels)
+        self.assertIn("Open…", labels)
+        self.assertIn("Save", labels)
+        w.close()
+
+    def test_new_clears_the_document(self):
+        w = self._window()
+        w.editor.setText("some text")
+        w.path = "/tmp/x.txt"
+        w.editor.setModified(False)                  # so no save prompt
+        w.new_file()
+        self.assertEqual(w.editor.text(), "")
+        self.assertIsNone(w.path)
+        self.assertEqual(w.windowTitle().replace("[*]", ""), "Untitled")
+        self.assertFalse(w.editor.isModified())
+        w.close()
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestAskDialog(unittest.TestCase):
+    """Ask answers arrive in a real, roomy window — not a cramped message box."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_dialog_is_large_and_resizable(self):
+        from raggy.app import AskDialog
+        d = AskDialog()
+        self.assertGreaterEqual(d.minimumWidth(), 640)
+        self.assertGreaterEqual(d.minimumHeight(), 460)
+        d.close()
+
+    def test_answer_text_is_shown_and_busy_state_toggles(self):
+        from raggy.app import AskDialog
+        d = AskDialog()
+        d.start("why is it slow?")
+        self.assertFalse(d.ask_btn.isEnabled())
+        d.show_answer("Because the queue is full.")
+        self.assertTrue(d.ask_btn.isEnabled())
+        self.assertIn("queue is full", d.answer.toPlainText())
+        d.close()
+
+    def test_question_signal_fires(self):
+        from raggy.app import AskDialog
+        seen = []
+        d = AskDialog()
+        d.asked.connect(seen.append)
+        d.question.setText("what breaks?")
+        d.ask_btn.click()
+        self.assertEqual(seen, ["what breaks?"])
+        d.close()
+
+    def test_ask_menu_opens_the_dialog(self):
+        from raggy.app import MainWindow
+        w = MainWindow()
+        w.ask_document()
+        self.assertIsNotNone(w._ask_dialog)
+        self.assertFalse(w._ask_dialog.isHidden())
+        w._ask_dialog.close()
+        w.close()
+
+    def test_the_three_answer_modes_are_formatted_honestly(self):
+        from raggy.app import MainWindow
+        gen = MainWindow._format_answer({
+            "mode": "generated", "answer": "Restart the worker.",
+            "citations": [{"line": 61, "text": "drain the worker first"}], "cited": [0]})
+        self.assertIn("Restart the worker.", gen)
+        self.assertIn("line 61", gen)
+
+        abst = MainWindow._format_answer({"mode": "abstained"})
+        self.assertIn("not appear to contain the answer", abst)
+
+        ro = MainWindow._format_answer({"mode": "retrieval_only"})
+        self.assertIn("API key", ro)
 
 
 if __name__ == "__main__":
