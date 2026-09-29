@@ -5,11 +5,14 @@ app.py — RaggyEditor, the desktop application.
 A plain text editor. One document, one window, a find bar that slides in when
 you ask for it — the way TextEdit works.
 
-    Cmd+N    new document
-    Cmd+O    open           Cmd+S    save          Cmd+Shift+S  save as
-    Cmd+F    find           Cmd+G / Cmd+Shift+G    next / previous
-    Cmd+E    use selection for find        Esc      close the find bar
+    Cmd+N    new document                     Cmd+O    open
+    Cmd+S    save                             Cmd+Shift+S  save as
+    Cmd+F    find                             Cmd+Alt+F    find and replace
+    Cmd+G / Cmd+Shift+G   next / previous     Cmd+E    use selection for find
+    Cmd+L    go to line                       Cmd+P    print
+    Cmd+= / Cmd+- / Cmd+0   zoom in / out / actual size
     Cmd+Shift+A   ask a question about this document
+    Esc      close the find bar
 
 ===============================================================================
 ONE SEARCH BOX, TWO KINDS OF ANSWER
@@ -18,19 +21,27 @@ The find field returns what every editor returns — the words you typed — AND
 passages that mean the same thing in different words. They arrive in one
 navigable list, so there is no "semantic mode" to switch to and no second panel.
 
+⚠️ ONLY THE EXACT MATCHES ARE REPLACEABLE. A "related" passage is a passage about
+the same subject, not an occurrence of what you typed, so replacing it would
+rewrite text you never searched for. Replace therefore operates on literal
+matches only and is disabled (with the reason shown) when there are none.
+
 ===============================================================================
 WHAT IS DELIBERATELY NOT HERE
 ===============================================================================
 No "Model" menu, no encoder picker, no "LSA / ONNX / neural" jargon, no status
-bar reporting cache statistics, no line-number gutter. Those are facts about the
-implementation, not about the user's document.
+bar reporting cache statistics, no line-number gutter.
 
 ⚠️ The one user-facing need behind them — "can this find things by meaning?" — is
 met by a single offer, made once, at the moment it matters: when a search finds
 nothing by exact match. Also reachable as Help ▸ Enable Search by Meaning…
 
-Internal names remain for developers: RAGGY_ENCODER=lsa|onnx|neural,
-./run.sh install-model.
+===============================================================================
+OFFSETS
+===============================================================================
+The engine reports CHARACTER offsets; Scintilla stores BYTES (it runs UTF-8).
+Every crossing of that boundary goes through raggy.offsets.OffsetMap — see that
+module for what goes wrong when it does not.
 """
 
 from __future__ import annotations
@@ -40,16 +51,19 @@ import re
 import sys
 
 from raggy import model_store
+from raggy.aiconfig import PROVIDERS, AIConfig
 from raggy.engine import RaggyEngine
+from raggy.offsets import OffsetMap
 
 try:
     from PyQt6 import Qsci
     from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QAction, QColor, QKeySequence, QPalette
+    from PyQt6.QtGui import QAction, QColor, QKeySequence, QPageSize, QPalette
     from PyQt6.QtWidgets import (
-        QApplication, QDialog, QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout,
-        QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-        QProgressDialog, QPushButton, QToolButton, QVBoxLayout, QWidget)
+        QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+        QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow,
+        QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QToolButton,
+        QVBoxLayout, QWidget)
     HAS_QT = True
 except Exception:                                                   # noqa: BLE001
     HAS_QT = False
@@ -62,8 +76,10 @@ COL_EXACT = 0x40E0FF        # Scintilla colours are BGR: amber
 COL_RELATED = 0xFFBE8C      # blue
 MAX_EXACT = 2000
 UNTITLED = "Untitled"
+MAX_RECENT = 10
 
 FIND_PLACEHOLDER = "Find — words, or describe what you mean"
+REPLACE_PLACEHOLDER = "Replace with…"
 
 
 def _bgr(colour) -> int:
@@ -106,6 +122,177 @@ if HAS_QT:
             except Exception as e:                                  # noqa: BLE001
                 self.failed.emit(f"{type(e).__name__}: {e}")
 
+    class TestAIConnection(QThread):
+        """One tiny round-trip, to prove the settings work before saving them."""
+
+        done = pyqtSignal(str)
+        failed = pyqtSignal(str)
+
+        def __init__(self, client):
+            super().__init__()
+            self.client = client
+
+        def run(self):
+            try:
+                reply = self.client.chat(
+                    "You are a connectivity check. Reply with the single word: OK",
+                    "Reply with the single word: OK").strip()
+                self.done.emit(reply[:80] or "(empty reply)")
+            except Exception as e:                                  # noqa: BLE001
+                self.failed.emit(f"{type(e).__name__}: {e}")
+
+    # =========================================================================
+    # SET UP AI ANSWERS
+    # =========================================================================
+    class AISetupDialog(QDialog):
+        """Connect an LLM, so Ask can write answers instead of only retrieving.
+
+        ⚠️ This dialog exists because the previous version told users "no API key
+        is set" and left them to discover, on their own, that a key was even
+        possible or how to supply one. Saying what is missing is not the same as
+        offering to fix it.
+        """
+
+        saved = pyqtSignal()
+
+        def __init__(self, config: AIConfig | None = None, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Set Up AI Answers")
+            self.setMinimumWidth(620)
+            self._config = config or AIConfig.load()
+            self._test: TestAIConnection | None = None
+
+            outer = QVBoxLayout(self)
+            intro = QLabel(
+                "Finding passages works on its own and always will.\n\n"
+                "Writing a <b>cited answer</b> to a question needs a language model. "
+                "Pick one below. A model running on this computer needs no key and "
+                "nothing is sent anywhere.")
+            intro.setWordWrap(True)
+            outer.addWidget(intro)
+
+            form = QFormLayout()
+            self.provider = QComboBox()
+            for key, meta in PROVIDERS.items():
+                self.provider.addItem(meta["label"], key)
+            idx = self.provider.findData(self._config.provider or "deepseek")
+            self.provider.setCurrentIndex(max(0, idx))
+            form.addRow("Where", self.provider)
+
+            self.base_url = QLineEdit(self._config.base_url)
+            self.base_url.setPlaceholderText("https://api.deepseek.com/v1")
+            form.addRow("Address", self.base_url)
+
+            self.model = QLineEdit(self._config.model)
+            self.model.setPlaceholderText("deepseek-chat")
+            form.addRow("Model", self.model)
+
+            self.api_key = QLineEdit(self._config.api_key)
+            self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+            self.api_key.setPlaceholderText("not needed for a local model")
+            form.addRow("API key", self.api_key)
+            outer.addLayout(form)
+
+            self.key_note = QLabel("")
+            self.key_note.setWordWrap(True)
+            self.key_note.setStyleSheet("color: palette(mid); font-size: 12px;")
+            outer.addWidget(self.key_note)
+
+            row = QHBoxLayout()
+            self.test_btn = QPushButton("Test Connection")
+            self.test_btn.clicked.connect(self._test_connection)
+            row.addWidget(self.test_btn)
+            self.result_label = QLabel("")
+            self.result_label.setWordWrap(True)
+            row.addWidget(self.result_label, 1)
+            outer.addLayout(row)
+
+            self.buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Save
+                | QDialogButtonBox.StandardButton.Cancel)
+            self.buttons.accepted.connect(self._save)
+            self.buttons.rejected.connect(self.reject)
+            outer.addWidget(self.buttons)
+
+            self.provider.currentIndexChanged.connect(self._provider_changed)
+            self.base_url.textChanged.connect(self._update_note)
+            # ⚠️ NOTE: the feedback label above is `result_label`, NOT `result`.
+            # `QDialog.result()` is a real method that exec()/accept() rely on;
+            # assigning an attribute called `result` silently replaces it and the
+            # dialog's return value stops working.
+            self._prefill_empty_fields()
+            self._update_note()
+
+        # ---------------------------------------------------------- internals
+        def _prefill_empty_fields(self):
+            """Fill blanks from the preset, without overwriting a saved config.
+
+            The provider combo is set before the change signal is connected, so
+            `_provider_changed` never runs for the initial selection. Without
+            this, opening the dialog on a config that records only a provider
+            (or a first run on a preset) leaves the fields empty.
+            """
+            meta = PROVIDERS.get(self.provider.currentData(), {})
+            if not self.base_url.text() and meta.get("base_url"):
+                self.base_url.setText(meta["base_url"])
+            if not self.model.text() and meta.get("model"):
+                self.model.setText(meta["model"])
+
+        def _provider_changed(self):
+            meta = PROVIDERS.get(self.provider.currentData(), {})
+            if meta.get("base_url"):
+                self.base_url.setText(meta["base_url"])
+            if meta.get("model"):
+                self.model.setText(meta["model"])
+            self._update_note()
+
+        def _current(self) -> AIConfig:
+            return AIConfig(provider=self.provider.currentData() or "",
+                            base_url=self.base_url.text().strip(),
+                            model=self.model.text().strip(),
+                            api_key=self.api_key.text().strip())
+
+        def _update_note(self):
+            cfg = self._current()
+            if cfg.needs_key:
+                self.key_note.setText(
+                    "⚠️ The key is saved as plain text in "
+                    "~/.config/RaggyEditor/ai.json, readable only by you. "
+                    "Leave it blank here and set OPENAI_API_KEY in the environment "
+                    "instead if you would rather not write it to disk.")
+            else:
+                self.key_note.setText(
+                    "This address is on this computer, so no key is needed and "
+                    "nothing leaves the machine.")
+
+        def _test_connection(self):
+            cfg = self._current()
+            if not cfg.base_url or not cfg.model:
+                self.result_label.setText("Fill in the address and the model first.")
+                return
+            self.test_btn.setEnabled(False)
+            self.result_label.setText("Trying…")
+            self._test = TestAIConnection(cfg.build_client())
+            self._test.done.connect(lambda r: self._tested(f"Working. The model said: “{r}”"))
+            self._test.failed.connect(lambda m: self._tested(f"Failed: {m}"))
+            self._test.start()
+
+        def _tested(self, message: str):
+            self.test_btn.setEnabled(True)
+            self.result_label.setText(message)
+
+        def _save(self):
+            cfg = self._current()
+            if not cfg.base_url or not cfg.model:
+                self.result_label.setText("An address and a model are required.")
+                return
+            if cfg.needs_key and not cfg.api_key:
+                self.result_label.setText("An API key is required for this provider.")
+                return
+            cfg.save()
+            self.saved.emit()
+            self.accept()
+
     # =========================================================================
     # ASK DIALOG
     # =========================================================================
@@ -113,11 +300,11 @@ if HAS_QT:
         """A question box and a large, resizable answer area.
 
         ⚠️ A QMessageBox is the obvious choice and the wrong one: it sizes itself
-        to its content, so a long cited answer arrives in a cramped box. This is
-        a real window the user can resize and read.
+        to its content, so a long cited answer arrives in a cramped box.
         """
 
         asked = pyqtSignal(str)
+        setupRequested = pyqtSignal()
 
         def __init__(self, parent=None):
             super().__init__(parent)
@@ -146,6 +333,18 @@ if HAS_QT:
                 "contain the answer, it will say so instead of guessing.")
             lay.addWidget(self.answer, 1)
 
+            bottom = QHBoxLayout()
+            # ⚠️ Shown only when no model is connected: this is the discovery path.
+            self.setup_btn = QPushButton("Set Up AI Answers…")
+            self.setup_btn.clicked.connect(self.setupRequested)
+            self.setup_btn.hide()
+            bottom.addWidget(self.setup_btn)
+            bottom.addStretch(1)
+            self.status = QLabel("")
+            self.status.setStyleSheet("color: palette(mid); font-size: 12px;")
+            bottom.addWidget(self.status)
+            lay.addLayout(bottom)
+
             buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
             buttons.rejected.connect(self.reject)
             lay.addWidget(buttons)
@@ -154,6 +353,13 @@ if HAS_QT:
             q = self.question.text().strip()
             if q:
                 self.asked.emit(q)
+
+        def set_ai_configured(self, configured: bool, description: str = ""):
+            self.setup_btn.setVisible(not configured)
+            self.status.setText("" if configured else
+                                "No model connected — answers are limited to passages.")
+            self.setWindowTitle("Ask About This Document"
+                                + ("" if configured else " — not set up"))
 
         def start(self, question: str):
             self.question.setText(question)
@@ -184,12 +390,14 @@ if HAS_QT:
             super().keyPressEvent(event)
 
     class FindBar(QFrame):
-        """The only search UI: a slim bar above the document."""
+        """The only search UI: a slim bar above the document, with an optional
+        replace row that stays hidden until the user asks for it."""
 
         queryChanged = pyqtSignal(str)
         nextRequested = pyqtSignal()
         prevRequested = pyqtSignal()
         closed = pyqtSignal()
+        replaceRequested = pyqtSignal(str, bool)      # (replacement, replace_all)
 
         def __init__(self):
             super().__init__()
@@ -198,14 +406,16 @@ if HAS_QT:
                 "FindBar { background: palette(window);"
                 " border-bottom: 1px solid palette(mid); }")
 
-            row = QHBoxLayout(self)
-            row.setContentsMargins(10, 6, 10, 6)
-            row.setSpacing(6)
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(10, 6, 10, 6)
+            outer.setSpacing(6)
 
+            row = QHBoxLayout()
+            row.setSpacing(6)
             self.field = FindField()
             self.field.setPlaceholderText(FIND_PLACEHOLDER)
             self.field.setClearButtonEnabled(True)
-            self.field.setMinimumWidth(300)
+            self.field.setMinimumWidth(280)
             self.field.textChanged.connect(self.queryChanged)
             self.field.returnPressed.connect(self._enter)
             self.field.escapePressed.connect(self.closed)
@@ -225,11 +435,44 @@ if HAS_QT:
             row.addWidget(self.prev_btn)
             row.addWidget(self.next_btn)
 
+            self.disclosure = QToolButton()
+            self.disclosure.setText("Replace")
+            self.disclosure.setCheckable(True)
+            self.disclosure.setAutoRaise(True)
+            self.disclosure.setToolTip("Show the replace field")
+            self.disclosure.toggled.connect(self._toggle_replace)
+            row.addWidget(self.disclosure)
+
             done = QToolButton()
             done.setText("Done")
             done.setAutoRaise(True)
             done.clicked.connect(self.closed)
             row.addWidget(done)
+
+            outer.addLayout(row)
+
+            # ---- replace row (hidden until asked for) ----
+            self.replace_row = QWidget()
+            rrow = QHBoxLayout(self.replace_row)
+            rrow.setContentsMargins(0, 0, 0, 0)
+            rrow.setSpacing(6)
+            spacer = QWidget()
+            spacer.setFixedWidth(2)
+            rrow.addWidget(spacer)
+            self.replace_field = QLineEdit()
+            self.replace_field.setPlaceholderText(REPLACE_PLACEHOLDER)
+            self.replace_field.setClearButtonEnabled(True)
+            rrow.addWidget(self.replace_field, 1)
+            self.replace_btn = QPushButton("Replace")
+            self.replace_all_btn = QPushButton("Replace All")
+            self.replace_btn.clicked.connect(lambda: self.replaceRequested.emit(
+                self.replace_field.text(), False))
+            self.replace_all_btn.clicked.connect(lambda: self.replaceRequested.emit(
+                self.replace_field.text(), True))
+            rrow.addWidget(self.replace_btn)
+            rrow.addWidget(self.replace_all_btn)
+            self.replace_row.hide()
+            outer.addWidget(self.replace_row)
 
         def _toggle(self, text, tip):
             b = QToolButton()
@@ -248,6 +491,23 @@ if HAS_QT:
             b.clicked.connect(signal)
             return b
 
+        def _toggle_replace(self, on: bool):
+            self.replace_row.setVisible(on)
+            if on:
+                self.replace_field.setFocus()
+
+        def show_replace(self, on: bool = True):
+            self.disclosure.setChecked(on)
+            self._toggle_replace(on)
+
+        def set_replace_enabled(self, enabled: bool, why: str = ""):
+            for b in (self.replace_btn, self.replace_all_btn):
+                b.setEnabled(enabled)
+            tip = "" if enabled else why
+            self.replace_btn.setToolTip(tip)
+            self.replace_all_btn.setToolTip(tip)
+            self.replace_field.setToolTip(tip)
+
         def _enter(self):
             if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
                 self.prevRequested.emit()
@@ -256,6 +516,9 @@ if HAS_QT:
 
         def query(self) -> str:
             return self.field.text()
+
+        def replacement(self) -> str:
+            return self.replace_field.text()
 
         def set_status(self, text: str):
             self.status.setText(text)
@@ -277,9 +540,12 @@ if HAS_QT:
             self._semantic_low = False
             self._workers: list[QThread] = []
             self._ask_dialog: AskDialog | None = None
+            self._offsets: OffsetMap | None = None
             self._settings = QSettings("RaggyEditor", "RaggyEditor")
             self._meaning_offer_made = bool(
                 self._settings.value("meaning_offer_made", False, type=bool))
+            self.ai = AIConfig.load()
+            self._apply_ai()
 
             self._index_timer = QTimer(self)
             self._index_timer.setSingleShot(True)
@@ -294,6 +560,7 @@ if HAS_QT:
             self._build_ui()
             self._build_menus()
             self._apply_theme()
+            self._apply_font()
             self._watch_theme()
             self._update_title()
 
@@ -311,27 +578,20 @@ if HAS_QT:
         # ------------------------------------------------------------------ UI
         def _build_ui(self):
             self.editor = Qsci.QsciScintilla()
-            self.editor.setUtf8(True)
+            self.editor.setUtf8(True)          # ⚠️ byte offsets: see raggy.offsets
             self.editor.setWrapMode(Qsci.QsciScintilla.WrapMode.WrapWord)
             self.editor.setCaretLineVisible(False)
 
             # ⚠️ Zero ALL THREE margins. Setting margin 0 to zero is not enough:
             # QScintilla gives margin 1 (the symbol/bookmark margin) a default
             # width of 16px, which shows up as a grey gutter down the left edge.
-            # It is width 0, not "not drawn", so it has to be set explicitly.
             for m in (0, 1, 2):
                 self.editor.setMarginWidth(m, 0)
             try:
-                # Breathing room around the text, as TextEdit has. Left and right
-                # are set together so the text block is not visibly off-centre.
                 self.editor.SendScintilla(Qsci.QsciScintilla.SCI_SETMARGINLEFT, 0, 8)
                 self.editor.SendScintilla(Qsci.QsciScintilla.SCI_SETMARGINRIGHT, 0, 8)
             except Exception:                                       # noqa: BLE001
                 pass
-
-            # The system font, at the system size — whatever the platform calls
-            # "default". On macOS this is the proportional UI font TextEdit uses.
-            self.editor.setFont(QApplication.font())
 
             self.find_bar = FindBar()
             self.find_bar.hide()
@@ -339,6 +599,8 @@ if HAS_QT:
             self.find_bar.nextRequested.connect(self._next)
             self.find_bar.prevRequested.connect(self._prev)
             self.find_bar.closed.connect(self._close_find)
+            self.find_bar.replaceRequested.connect(self._do_replace)
+            self.find_bar.set_replace_enabled(False, "Search for something first")
 
             central = QWidget()
             col = QVBoxLayout(central)
@@ -354,14 +616,91 @@ if HAS_QT:
             except Exception:                                       # noqa: BLE001
                 pass
 
+        def _build_menus(self):
+            m = self.menuBar()
+
+            f = m.addMenu("&File")
+            self._act(f, "&New", QKeySequence.StandardKey.New, self.new_file)
+            self._act(f, "&Open…", QKeySequence.StandardKey.Open, self.open_file)
+            self.recent_menu = f.addMenu("Open &Recent")
+            self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
+            f.addSeparator()
+            self._act(f, "&Save", QKeySequence.StandardKey.Save, self.save_file)
+            self._act(f, "Save &As…", QKeySequence.StandardKey.SaveAs, self.save_as)
+            f.addSeparator()
+            self._act(f, "&Export as PDF…", None, self.export_pdf)
+            self._act(f, "&Print…", QKeySequence.StandardKey.Print, self.print_document)
+            f.addSeparator()
+            self._act(f, "&Close", QKeySequence.StandardKey.Close, self.close)
+
+            e = m.addMenu("&Edit")
+            self._act(e, "&Undo", QKeySequence.StandardKey.Undo, self.editor.undo)
+            self._act(e, "&Redo", QKeySequence.StandardKey.Redo, self.editor.redo)
+            e.addSeparator()
+            self._act(e, "Cu&t", QKeySequence.StandardKey.Cut, self.editor.cut)
+            self._act(e, "&Copy", QKeySequence.StandardKey.Copy, self.editor.copy)
+            self._act(e, "&Paste", QKeySequence.StandardKey.Paste, self.editor.paste)
+            e.addSeparator()
+            self._act(e, "Select &All", QKeySequence.StandardKey.SelectAll,
+                      self.editor.selectAll)
+            t = e.addMenu("&Transformations")
+            self._act(t, "Make &Upper Case", "Ctrl+Shift+U",
+                      lambda: self.transform_case("upper"))
+            self._act(t, "Make &Lower Case", "Ctrl+Shift+L",
+                      lambda: self.transform_case("lower"))
+            self._act(t, "&Capitalize", None, lambda: self.transform_case("capitalize"))
+
+            d = m.addMenu("&Find")
+            self._act(d, "&Find…", QKeySequence.StandardKey.Find, self.show_find)
+            self._act(d, "Find and &Replace…", "Ctrl+Alt+F", self.show_replace)
+            self._act(d, "Find &Next", QKeySequence.StandardKey.FindNext, self._next)
+            self._act(d, "Find &Previous", QKeySequence.StandardKey.FindPrevious, self._prev)
+            self._act(d, "Use Selection for Find", "Ctrl+E", self._use_selection)
+            d.addSeparator()
+            self._act(d, "&Go to Line…", "Ctrl+L", self.go_to_line)
+            d.addSeparator()
+            self._act(d, "&Ask a Question About This Document…", "Ctrl+Shift+A",
+                      self.ask_document)
+
+            v = m.addMenu("&View")
+            self._act(v, "Zoom &In", "Ctrl+=", self.zoom_in)
+            self._act(v, "Zoom &Out", "Ctrl+-", self.zoom_out)
+            self._act(v, "&Actual Size", "Ctrl+0", self.zoom_reset)
+
+            h = m.addMenu("&Help")
+            self._act(h, "Set Up AI Answers…", None, self.setup_ai)
+            self._act(h, "Enable Search by Meaning…", None, self.enable_meaning_search)
+            h.addSeparator()
+            self._act(h, "&About " + APP_NAME, None, self.about)
+
+        def _act(self, menu, text, shortcut, slot, checkable=False):
+            a = QAction(text, self)
+            a.setCheckable(checkable)
+            if shortcut:
+                a.setShortcut(shortcut if isinstance(shortcut, str)
+                              else QKeySequence(shortcut))
+            a.triggered.connect(slot)
+            menu.addAction(a)
+            return a
+
+        # --------------------------------------------------------------- title
+        def _update_title(self):
+            """TextEdit shows the document NAME, not the application name.
+
+            ⚠️ The `[*]` placeholder is required, not cosmetic: Qt substitutes it
+            with the modified marker (the dot in the close button on macOS), and
+            `setWindowModified()` silently does nothing without it.
+            """
+            name = os.path.basename(self.path) if self.path else UNTITLED
+            self.setWindowTitle(name + "[*]")
+            try:
+                self.setWindowFilePath(self.path or "")
+            except Exception:                                       # noqa: BLE001
+                pass
+
         # ------------------------------------------------------------- theming
         def _is_dark(self) -> bool:
-            """Is the app currently in dark mode?
-
-            Qt 6.5+ reports the platform colour scheme directly. `Unknown` is
-            returned when the platform has no opinion (or in a headless/offscreen
-            run), so fall back to reading the palette the app was given.
-            """
+            """Qt 6.5+ reports the scheme directly; Unknown means ask the palette."""
             try:
                 scheme = QApplication.styleHints().colorScheme()
                 if scheme == Qt.ColorScheme.Dark:
@@ -383,11 +722,11 @@ if HAS_QT:
             """
             dark = self._is_dark()
             if dark:
-                paper = QColor("#1e1e1e")   # background
-                ink = QColor("#e8e8e8")     # text
-                caret = QColor("#ffffff")   # ⚠️ bright: a dark caret is invisible here
+                paper = QColor("#1e1e1e")
+                ink = QColor("#e8e8e8")
+                caret = QColor("#ffffff")   # ⚠️ bright: a dark caret is invisible
                 sel_bg, sel_fg = QColor("#2f5fa8"), QColor("#ffffff")
-                exact, related = 0x66D1FF, 0xFFA96A      # brighter, for a dark pane
+                exact, related = 0x66D1FF, 0xFFA96A
             else:
                 paper = QColor("#ffffff")
                 ink = QColor("#000000")
@@ -406,11 +745,9 @@ if HAS_QT:
                     (e.setCaretLineBackgroundColor, paper)):
                 try:
                     setter(value)
-                except Exception:                                   # noqa: BLE001
+                except Exception:                                       # noqa: BLE001
                     pass
 
-            # Default style + STYLECLEARALL, so any style QScintilla defaults to
-            # (rather than one we set) also takes the theme.
             S = Qsci.QsciScintilla
             try:
                 e.SendScintilla(S.SCI_STYLESETFORE, S.STYLE_DEFAULT, _bgr(ink))
@@ -430,70 +767,67 @@ if HAS_QT:
                 except Exception:                                   # noqa: BLE001
                     pass
 
-            # Indicators are re-painted from the current colours.
             self._highlight()
 
-        def _build_menus(self):
-            m = self.menuBar()
+        # --------------------------------------------------------------- font
+        def _base_point_size(self) -> int:
+            size = QApplication.font().pointSize()
+            return size if size > 0 else 13
 
-            f = m.addMenu("&File")
-            self._act(f, "&New", QKeySequence.StandardKey.New, self.new_file)
-            self._act(f, "&Open…", QKeySequence.StandardKey.Open, self.open_file)
-            f.addSeparator()
-            self._act(f, "&Save", QKeySequence.StandardKey.Save, self.save_file)
-            self._act(f, "Save &As…", QKeySequence.StandardKey.SaveAs, self.save_as)
-            f.addSeparator()
-            self._act(f, "&Close", QKeySequence.StandardKey.Close, self.close)
+        def _apply_font(self):
+            stored = self._settings.value("font_size", 0, type=int)
+            size = stored or self._base_point_size()
+            font = QApplication.font()
+            if size > 0:
+                font.setPointSize(size)
+            self.editor.setFont(font)
 
-            e = m.addMenu("&Edit")
-            self._act(e, "&Undo", QKeySequence.StandardKey.Undo, self.editor.undo)
-            self._act(e, "&Redo", QKeySequence.StandardKey.Redo, self.editor.redo)
-            e.addSeparator()
-            self._act(e, "Cu&t", QKeySequence.StandardKey.Cut, self.editor.cut)
-            self._act(e, "&Copy", QKeySequence.StandardKey.Copy, self.editor.copy)
-            self._act(e, "&Paste", QKeySequence.StandardKey.Paste, self.editor.paste)
-            self._act(e, "Select &All", QKeySequence.StandardKey.SelectAll,
-                      self.editor.selectAll)
+        def _set_font_size(self, size: int, remember: bool):
+            size = max(8, min(72, size))
+            self._settings.setValue("font_size", size if remember else 0)
+            self._apply_font()
 
-            d = m.addMenu("&Find")
-            self._act(d, "&Find…", QKeySequence.StandardKey.Find, self.show_find)
-            self._act(d, "Find &Next", QKeySequence.StandardKey.FindNext, self._next)
-            self._act(d, "Find &Previous", QKeySequence.StandardKey.FindPrevious, self._prev)
-            self._act(d, "Use Selection for Find", "Ctrl+E", self._use_selection)
-            d.addSeparator()
-            self._act(d, "&Ask a Question About This Document…", "Ctrl+Shift+A",
-                      self.ask_document)
+        def zoom_in(self):
+            self._set_font_size(self.editor.font().pointSize() + 1, True)
 
-            h = m.addMenu("&Help")
-            self._act(h, "Enable Search by Meaning…", None, self.enable_meaning_search)
-            h.addSeparator()
-            self._act(h, "&About " + APP_NAME, None, self.about)
+        def zoom_out(self):
+            self._set_font_size(self.editor.font().pointSize() - 1, True)
 
-        def _act(self, menu, text, shortcut, slot, checkable=False):
-            a = QAction(text, self)
-            a.setCheckable(checkable)
-            if shortcut:
-                a.setShortcut(shortcut if isinstance(shortcut, str) else QKeySequence(shortcut))
-            a.triggered.connect(slot)
-            menu.addAction(a)
-            return a
+        def zoom_reset(self):
+            self._settings.setValue("font_size", 0)
+            self._apply_font()
 
-        # --------------------------------------------------------------- title
-        def _update_title(self):
-            """TextEdit shows the document NAME, not the application name.
+        # ------------------------------------------------------------ offsets
+        def _om(self) -> OffsetMap:
+            """Char↔byte map for the current buffer, rebuilt when it changes."""
+            if self._offsets is None or self._offsets.text != self.editor.text():
+                self._offsets = OffsetMap(self.editor.text())
+            return self._offsets
 
-            ⚠️ The `[*]` placeholder is required, not cosmetic: Qt substitutes it
-            with the modified marker (the dot in the close button on macOS), and
-            `setWindowModified()` silently does nothing without it — Qt warns
-            "The window title does not contain a '[*]' placeholder" and the user
-            gets no unsaved-changes indicator.
-            """
-            name = os.path.basename(self.path) if self.path else UNTITLED
-            self.setWindowTitle(name + "[*]")
-            try:
-                self.setWindowFilePath(self.path or "")
-            except Exception:                                       # noqa: BLE001
-                pass
+        def _select_chars(self, start: int, end: int):
+            """Select a CHARACTER range (Scintilla wants bytes)."""
+            om = self._om()
+            S = Qsci.QsciScintilla
+            self.editor.SendScintilla(S.SCI_SETSEL, om.to_byte(start), om.to_byte(end))
+
+        def _sel_chars(self) -> tuple[int, int]:
+            """The current selection as CHARACTER offsets."""
+            om = self._om()
+            S = Qsci.QsciScintilla
+            a = self.editor.SendScintilla(S.SCI_GETSELECTIONSTART)
+            b = self.editor.SendScintilla(S.SCI_GETSELECTIONEND)
+            return om.to_char(a), om.to_char(b)
+
+        def _replace_chars(self, start: int, end: int, text: str) -> int:
+            """Replace a CHARACTER range with `text`, as one undoable edit."""
+            om = self._om()
+            S = Qsci.QsciScintilla
+            blen = len(text.encode("utf-8"))
+            self.editor.SendScintilla(S.SCI_SETTARGETSTART, om.to_byte(start))
+            self.editor.SendScintilla(S.SCI_SETTARGETEND, om.to_byte(end))
+            self.editor.SendScintilla(S.SCI_REPLACETARGET, blen, text.encode("utf-8"))
+            self._offsets = None            # the buffer moved; the map is stale
+            return blen
 
         # --------------------------------------------------------------- files
         def _confirm_discard(self) -> bool:
@@ -513,6 +847,7 @@ if HAS_QT:
                 return
             self.path = None
             self._indexed_text = ""
+            self._offsets = None
             self.editor.setText("")
             self.editor.setModified(False)
             self._update_title()
@@ -537,8 +872,10 @@ if HAS_QT:
                 return
             self.path = path
             self._indexed_text = ""
+            self._offsets = None
             self.editor.setModified(False)
             self._update_title()
+            self._remember_recent(path)
             self._index_document()
             if self.find_bar.isVisible() and self.find_bar.query():
                 self._run_search()
@@ -553,11 +890,13 @@ if HAS_QT:
                 QMessageBox.warning(self, APP_NAME, f"Could not save:\n{e}")
                 return False
             self.editor.setModified(False)
+            self._remember_recent(self.path)
             return True
 
         def save_as(self) -> bool:
             p, _ = QFileDialog.getSaveFileName(
-                self, "Save As", os.path.expanduser("~"), "Text files (*.txt);;All files (*)")
+                self, "Save As", os.path.expanduser("~"),
+                "Text files (*.txt);;All files (*)")
             if not p:
                 return False
             self.path = p
@@ -567,8 +906,100 @@ if HAS_QT:
                 self._update_title()
             return ok
 
+        # ----------------------------------------------------------- printing
+        def _document(self):
+            from PyQt6.QtGui import QTextDocument
+            doc = QTextDocument()
+            doc.setDefaultFont(self.editor.font())
+            doc.setPlainText(self.editor.text())
+            return doc
+
+        def print_document(self):
+            from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+            dlg = QPrintDialog(printer, self)
+            dlg.setWindowTitle("Print")
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._document().print(printer)
+
+        def export_pdf(self):
+            from PyQt6.QtGui import QPdfWriter
+            suggested = os.path.expanduser("~")
+            if self.path:
+                suggested = os.path.splitext(self.path)[0] + ".pdf"
+            p, _ = QFileDialog.getSaveFileName(self, "Export as PDF", suggested,
+                                               "PDF files (*.pdf)")
+            if not p:
+                return
+            if not p.lower().endswith(".pdf"):
+                p += ".pdf"
+            writer = QPdfWriter(p)
+            writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+            try:
+                self._document().print(writer)
+            except Exception as e:                                  # noqa: BLE001
+                QMessageBox.warning(self, APP_NAME, f"Could not export:\n{e}")
+                return
+            self._remember_recent(p)
+
+        # --------------------------------------------------------- recent files
+        def _recent_paths(self) -> list[str]:
+            raw = self._settings.value("recent", [])
+            if isinstance(raw, str):
+                raw = [raw]
+            return [p for p in (raw or []) if isinstance(p, str)]
+
+        def _remember_recent(self, path: str):
+            items = [p for p in self._recent_paths() if p != path]
+            items.insert(0, path)
+            self._settings.setValue("recent", items[:MAX_RECENT])
+
+        def _fill_recent_menu(self):
+            self.recent_menu.clear()
+            items = self._recent_paths()
+            if not items:
+                a = QAction("(nothing yet)", self)
+                a.setEnabled(False)
+                self.recent_menu.addAction(a)
+                return
+            for p in items:
+                a = QAction(os.path.basename(p) + "  —  " + p, self)
+                a.triggered.connect(lambda _=False, path=p: self._open_recent(path))
+                self.recent_menu.addAction(a)
+            self.recent_menu.addSeparator()
+            clear = QAction("Clear Menu", self)
+            clear.triggered.connect(lambda: self._settings.setValue("recent", []))
+            self.recent_menu.addAction(clear)
+
+        def _open_recent(self, path: str):
+            if not os.path.exists(path):
+                QMessageBox.information(self, APP_NAME,
+                                        f"That file is no longer there:\n{path}")
+                self._settings.setValue(
+                    "recent", [p for p in self._recent_paths() if p != path])
+                return
+            if self._confirm_discard():
+                self.load_path(path)
+
+        # --------------------------------------------------- transformations
+        def transform_case(self, mode: str):
+            start, end = self._sel_chars()
+            if start == end:                      # no selection: whole document
+                start, end = 0, len(self.editor.text())
+            piece = self.editor.text()[start:end]
+            if mode == "upper":
+                new = piece.upper()
+            elif mode == "lower":
+                new = piece.lower()
+            else:
+                new = " ".join(w.capitalize() for w in re.split(r"(\s+)", piece))
+            if new != piece:
+                self._replace_chars(start, end, new)
+
         # ------------------------------------------------------------- indexing
         def _on_text_changed(self):
+            self._offsets = None
             self._index_timer.start()
 
         def _index_document(self):
@@ -587,19 +1018,23 @@ if HAS_QT:
 
         # ---------------------------------------------------------------- find
         def _selected_text(self) -> str:
-            """Read from Scintilla positions: `selectedText()` is empty when the
-            editor does not hold focus, which is exactly when the bar has it."""
-            S = Qsci.QsciScintilla
+            """Read via Scintilla positions then map bytes back to characters.
+
+            ⚠️ Not `editor.selectedText()`: that returns an empty string in some
+            QScintilla builds when the editor does not hold focus — which is
+            exactly when the find bar has it.
+            """
             try:
-                a = self.editor.SendScintilla(S.SCI_GETSELECTIONSTART)
-                b = self.editor.SendScintilla(S.SCI_GETSELECTIONEND)
+                a, b = self._sel_chars()
             except Exception:                                       # noqa: BLE001
                 return ""
             text = self.editor.text()
             return text[a:b] if 0 <= a < b <= len(text) else ""
 
-        def show_find(self):
+        def show_find(self, with_replace: bool = False):
             self.find_bar.show()
+            if with_replace:
+                self.find_bar.show_replace(True)
             sel = self._selected_text()
             if sel and "\n" not in sel and not self.find_bar.query():
                 self.find_bar.field.setText(sel)
@@ -608,8 +1043,12 @@ if HAS_QT:
             if self.find_bar.query():
                 self._run_search()
 
+        def show_replace(self):
+            self.show_find(with_replace=True)
+
         def _close_find(self):
             self.find_bar.hide()
+            self.find_bar.show_replace(False)
             self._clear_indicators()
             self.editor.setFocus()
 
@@ -633,23 +1072,30 @@ if HAS_QT:
 
             if not query:
                 self.find_bar.set_status("")
+                self.find_bar.set_replace_enabled(False, "Search for something first")
                 return
 
             exact = self._exact_matches(query)
             if exact is None:
+                self.find_bar.set_replace_enabled(False, "Fix the expression first")
                 return                          # bad regex; message already shown
             related = self._related_passages(query)
             seen = {(r["start"], r["end"]) for r in exact}
             self._results = exact + [r for r in related
                                      if (r["start"], r["end"]) not in seen]
 
+            # ⚠️ Only literal matches can be replaced. "Related" passages are
+            # about the same subject, not occurrences of the query string, so
+            # replacing them would rewrite text the user never searched for.
+            self.find_bar.set_replace_enabled(
+                bool(exact),
+                "Nothing to replace — no exact matches for this search")
+
             self._highlight()
             self._update_status()
             if self._results:
                 self._select_current()
 
-            # The one moment worth mentioning meaning-search: you asked for
-            # something, and by exact match alone, this document has nothing.
             if not exact and self._should_offer_meaning():
                 self._offer_meaning_search()
 
@@ -680,10 +1126,41 @@ if HAS_QT:
             return [{"kind": "related", "start": h["start"], "end": h["end"]}
                     for h in res.get("results", [])]
 
+        # ------------------------------------------------------------- replace
+        def _do_replace(self, replacement: str, replace_all: bool):
+            exact = [r for r in self._results if r["kind"] == "match"]
+            if not exact:
+                self.find_bar.set_status("Nothing to replace — no exact matches")
+                return
+            targets = exact if replace_all else [self._results[self._current]]
+            targets = [r for r in targets if r["kind"] == "match"]
+            if not targets:
+                self.find_bar.set_status("The current result is a related passage, "
+                                         "not an exact match — nothing to replace")
+                return
+
+            omitted = len(self._results) - len(exact)
+            S = Qsci.QsciScintilla
+            self.editor.SendScintilla(S.SCI_BEGINUNDOACTION)
+            try:
+                # ⚠️ Back to front: replacing text shifts every offset after it.
+                for r in sorted(targets, key=lambda r: r["start"], reverse=True):
+                    self._replace_chars(r["start"], r["end"], replacement)
+            finally:
+                self.editor.SendScintilla(S.SCI_ENDUNDOACTION)
+
+            n = len(targets)
+            word = "replacement" if n == 1 else "replacements"
+            self.find_bar.set_status(f"Replaced {n} {word}")
+            self._index_timer.start()
+            self._run_search()                 # offsets all moved; search afresh
+            if omitted and not replace_all:
+                pass                           # related passages are never replaced
+
         # -------------------------------------------------------- highlighting
         def _clear_indicators(self):
             S = Qsci.QsciScintilla
-            length = len(self.editor.text())
+            length = self._om().byte_length
             try:
                 for ind in (IND_EXACT, IND_RELATED):
                     self.editor.SendScintilla(S.SCI_SETINDICATORCURRENT, ind)
@@ -693,12 +1170,14 @@ if HAS_QT:
 
         def _highlight(self):
             S = Qsci.QsciScintilla
+            om = self._om()
             try:
                 for r in self._results:
                     ind = IND_EXACT if r["kind"] == "match" else IND_RELATED
                     self.editor.SendScintilla(S.SCI_SETINDICATORCURRENT, ind)
+                    start = om.to_byte(r["start"])
                     self.editor.SendScintilla(S.SCI_INDICATORFILLRANGE,
-                                              r["start"], r["end"] - r["start"])
+                                              start, om.to_byte(r["end"]) - start)
             except Exception:                                       # noqa: BLE001
                 pass
 
@@ -726,8 +1205,10 @@ if HAS_QT:
             r = self._results[self._current]
             S = Qsci.QsciScintilla
             try:
-                self.editor.SendScintilla(S.SCI_SETSEL, r["start"], r["end"])
-                line = self.editor.SendScintilla(S.SCI_LINEFROMPOSITION, r["start"])
+                self._select_chars(r["start"], r["end"])
+                om = self._om()
+                line = self.editor.SendScintilla(
+                    S.SCI_LINEFROMPOSITION, om.to_byte(r["start"]))
                 self.editor.ensureLineVisible(line)
             except Exception:                                       # noqa: BLE001
                 pass
@@ -747,9 +1228,17 @@ if HAS_QT:
             self._current = (self._current - 1) % len(self._results)
             self._select_current()
 
+        def go_to_line(self):
+            total = self.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETLINECOUNT)
+            n, ok = QInputDialog.getInt(self, "Go to Line",
+                                        f"Line number (1–{max(1, total)}):",
+                                        1, 1, max(1, total))
+            if ok:
+                self.editor.SendScintilla(Qsci.QsciScintilla.SCI_GOTOLINE, n - 1)
+                self.editor.setFocus()
+
         # ------------------------------------------------- meaning search offer
         def _should_offer_meaning(self) -> bool:
-            """Offer the download once, only when it would actually help."""
             if self._meaning_offer_made or model_store.is_available():
                 return False
             from raggy.encoder import onnx_importable
@@ -804,11 +1293,35 @@ if HAS_QT:
             self._indexed_text = ""
             self._index_document()
 
+        # ------------------------------------------------------------ AI setup
+        def _apply_ai(self):
+            """Point the engine at the configured model.
+
+            With nothing configured, `build_client()` still falls back to the
+            OPENAI_* environment variables, so a user who prefers not to write a
+            key to disk is not locked out.
+            """
+            self.engine.llm = self.ai.build_client()
+
+        def setup_ai(self):
+            dlg = AISetupDialog(self.ai, self)
+            dlg.saved.connect(self._ai_saved)
+            dlg.exec()
+
+        def _ai_saved(self):
+            self.ai = AIConfig.load()
+            self._apply_ai()
+            if self._ask_dialog:
+                self._ask_dialog.set_ai_configured(self.ai.configured,
+                                                   self.ai.describe())
+
         # ----------------------------------------------------------------- ask
         def ask_document(self):
             if self._ask_dialog is None:
                 self._ask_dialog = AskDialog(self)
                 self._ask_dialog.asked.connect(self._ask)
+                self._ask_dialog.setupRequested.connect(self.setup_ai)
+            self._ask_dialog.set_ai_configured(self.ai.configured, self.ai.describe())
             self._ask_dialog.show()
             self._ask_dialog.raise_()
             self._ask_dialog.activateWindow()
@@ -837,11 +1350,12 @@ if HAS_QT:
                 return ("This document does not appear to contain the answer.\n\n"
                         "RaggyEditor says so rather than guessing.")
             if mode == "retrieval_only":
-                return ("No answer can be written without an API key, so here are the "
-                        "relevant passages — press Cmd+F and search for the topic to "
-                        "see them highlighted.\n\n"
-                        "To enable written answers, add your key to the project's .env "
-                        "file. DeepSeek works unchanged.")
+                return ("No model is connected, so no answer can be written — here is "
+                        "what the document says. The passages are ranked by relevance; "
+                        "press Cmd+F and search for the topic to see them "
+                        "highlighted.\n\n"
+                        "To get written answers, choose Help ▸ Set Up AI Answers… — "
+                        "a model on this computer needs no key and no account.")
             body = data.get("answer") or ""
             cites = data.get("citations") or []
             used = data.get("cited") or []
@@ -855,10 +1369,12 @@ if HAS_QT:
 
         # --------------------------------------------------------------- about
         def about(self):
+            answers = self.ai.describe()
             QMessageBox.about(self, f"About {APP_NAME}", (
                 f"<b>{APP_NAME}</b><br><br>"
                 "A plain text editor that can find passages by meaning, as well as "
                 "by the exact words you type.<br><br>"
+                f"Answers: {answers}<br>"
                 "Free software under the GNU General Public License v3.<br>"
                 "Editing engine: Scintilla."))
 
@@ -890,6 +1406,9 @@ else:  # pragma: no cover
         pass
 
     class AskDialog:  # type: ignore
+        pass
+
+    class AISetupDialog:  # type: ignore
         pass
 
 

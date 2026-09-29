@@ -33,8 +33,12 @@ Cmd+F  "how do I fix an expired certificate on a replica"
 |---|---|
 | `Cmd+N` / `Cmd+O` / `Cmd+S` / `Cmd+Shift+S` | New · Open · Save · Save As |
 | `Cmd+F` | Find (exact **and** meaning) |
+| `Cmd+Alt+F` | Find and Replace |
 | `Cmd+G` / `Cmd+Shift+G` | Find next / previous |
 | `Cmd+E` | Use selection for find |
+| `Cmd+L` | Go to line |
+| `Cmd+=` / `Cmd+-` / `Cmd+0` | Zoom in · out · actual size |
+| `Cmd+P` | Print (and File ▸ Export as PDF…) |
 | `Esc` | Close the find bar |
 | `Cmd+Shift+A` | Ask a question about this document |
 
@@ -46,15 +50,53 @@ caret and search highlights — QScintilla does not follow the application palet
 on its own, so a black caret on a dark pane is the default failure mode and is
 set explicitly.
 
-It runs **fully offline** with no API key, ships as a **single downloadable
-app**, and fetches its embedding model once, on request.
+### Replace, and why it only touches exact matches
 
-**Ask a Question About This Document…** (`Cmd+Shift+A`, under the Find menu) is
-there too, but as a menu command that opens a dialog — not a permanent pane. It
-retrieves the relevant passages and writes a cited answer through an
-OpenAI-compatible key (DeepSeek works unchanged); with no key it shows the
-passages instead of inventing prose, and it refuses when the answer is not in the
-document.
+The find bar has a **Replace** disclosure that reveals a replace row with
+**Replace** and **Replace All**. A whole replace run is a single undo step.
+
+⚠️ Replace operates on **literal matches only**. A "related" passage came back
+because it is *about* the same subject, not because it contains what you typed —
+rewriting it would edit text you never searched for. When a search returns only
+meaning matches, the replace controls are disabled and say why.
+
+The replacement text is inserted literally: `\1` is not expanded, even in regular
+expression mode.
+
+### Answers need a model — and the app says so
+
+**Ask a Question About This Document…** (`Cmd+Shift+A`, under the Find menu) opens
+a dialog, not a permanent pane. Retrieval is local and always works; **writing a
+cited answer needs a language model.**
+
+⚠️ Retrieval and generation are different things, and the 133 MB download is only
+the first one:
+
+| | Needs | Works offline |
+|---|---|---|
+| **Find** (words + meaning) | the embedding model (~133 MB) | ✅ |
+| **Ask** (a written, cited answer) | an LLM — cloud key, or a model on this computer | depends |
+
+So `Help ▸ Set Up AI Answers…` asks one question — *where should the model come
+from?* — and offers:
+
+| | |
+|---|---|
+| **DeepSeek** / **OpenAI** | paste a key; nothing else to install |
+| **Ollama** / **LM Studio** | a model already running on this computer — no key, nothing sent anywhere |
+| **Something else** | any OpenAI-compatible server |
+
+There is a **Test Connection** button, so you find out immediately whether it
+works rather than when you next need an answer. If no model is connected, the Ask
+dialog shows a **Set Up AI Answers…** button instead of leaving you to guess.
+
+The key is stored in `~/.config/RaggyEditor/ai.json` with mode `0600`. ⚠️ It is
+**plain text and not encrypted** — file permissions are the only protection. Set
+`OPENAI_API_KEY` in the environment instead if you would rather not write it to
+disk.
+
+Without a model, Ask returns the ranked passages and says plainly that no answer
+can be written. It never invents prose.
 
 ### What is deliberately *not* in the UI
 
@@ -67,8 +109,8 @@ A text editor should not ask you to make decisions about its implementation. So:
 | Status bar ("re-encoded 1, reused 19 · 12 ms") | Cache statistics are not facts about your document. |
 | Line-number gutter, wrap toggle | TextEdit has neither; wrap is always on. |
 
-The escape hatches still exist for developers: `RAGGY_ENCODER=lsa|onnx|neural`
-and `./run.sh install-model`.
+The View menu holds only zoom. The escape hatches for developers remain:
+`RAGGY_ENCODER=lsa|onnx|neural` and `./run.sh install-model`.
 
 ---
 
@@ -135,7 +177,7 @@ from **Help ▸ Enable Search by Meaning…**.
 ./run.sh install      # .venv with the full app stack (engine + GUI + ONNX)
 ./run.sh app          # launch the editor
 ./run.sh demo         # offline engine tour — no GUI, no model, no key
-./run.sh test         # 92 tests
+./run.sh test         # 130 tests
 ```
 
 ### Just the engine, no Qt
@@ -301,14 +343,24 @@ answer.
 
 ## Verified / not verified
 
-✅ **92 tests pass** (`./run.sh test`), hermetic — no network, no model download.
+✅ **130 tests pass** (`./run.sh test`), hermetic — no network, no model download,
+and QSettings/config redirected into a scratch directory so nothing touches your
+real preferences.
 ✅ The offset invariant (`chunk.text == document[start:end]`) is asserted in the
 chunker **and** tested for every strategy, so highlight-jump cannot drift.
+✅ ⚠️ **Character offsets are converted to UTF-8 byte offsets** at the Scintilla
+boundary (`raggy/offsets.py`). This was a real bug: the editor highlighted the
+wrong text in any document containing a non-ASCII character before the match.
+The old tests missed it because they compared the *numbers* the engine produced
+with the numbers Scintilla echoed back — both read "25" while the editor selected
+different characters. The regression test asserts on the **selected text**.
 ✅ **The GUI is tested headlessly** (`tests/test_app.py`): the single-pane layout
-is guarded (a test fails if a tab widget or splitter returns), plus bar
-visibility, exact+related results in one list, regex toggle, bad-regex reporting,
-next/previous wrapping, use-selection-for-find, jump-to-exact-span, and the
-edit-debounce timer.
+is guarded (a test fails if a tab widget or splitter returns), the absence of a
+Model menu and a status bar, bar visibility, exact+related results in one list,
+regex toggle, bad-regex reporting, next/previous wrapping, use-selection-for-find,
+jump-to-exact-span, replace (all/one, disabled for meaning-only results, correct
+after multibyte text), zoom, go-to-line, transformations, recent files, the AI
+setup dialog, and the edit-debounce timer.
 ✅ Incremental re-index is asserted **identical to a cold rebuild**, and both
 cache-invalidation rules (different document, different encoder) are tested.
 ✅ **ONNX embeddings equal torch embeddings** (cosine 1.00000).
