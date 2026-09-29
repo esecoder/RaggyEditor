@@ -41,6 +41,11 @@ Cmd+F  "how do I fix an expired certificate on a replica"
 The window title is the **document name** — `Untitled` until you save — with the
 macOS proxy icon and the unsaved-changes dot, exactly as TextEdit shows them.
 
+The app follows the **system appearance**. Dark mode switches the pane, text,
+caret and search highlights — QScintilla does not follow the application palette
+on its own, so a black caret on a dark pane is the default failure mode and is
+set explicitly.
+
 It runs **fully offline** with no API key, ships as a **single downloadable
 app**, and fetches its embedding model once, on request.
 
@@ -130,7 +135,7 @@ from **Help ▸ Enable Search by Meaning…**.
 ./run.sh install      # .venv with the full app stack (engine + GUI + ONNX)
 ./run.sh app          # launch the editor
 ./run.sh demo         # offline engine tour — no GUI, no model, no key
-./run.sh test         # 88 tests
+./run.sh test         # 92 tests
 ```
 
 ### Just the engine, no Qt
@@ -296,7 +301,7 @@ answer.
 
 ## Verified / not verified
 
-✅ **88 tests pass** (`./run.sh test`), hermetic — no network, no model download.
+✅ **92 tests pass** (`./run.sh test`), hermetic — no network, no model download.
 ✅ The offset invariant (`chunk.text == document[start:end]`) is asserted in the
 chunker **and** tested for every strategy, so highlight-jump cannot drift.
 ✅ **The GUI is tested headlessly** (`tests/test_app.py`): the single-pane layout

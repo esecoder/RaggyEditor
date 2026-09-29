@@ -359,5 +359,70 @@ class TestAskDialog(unittest.TestCase):
         self.assertIn("API key", ro)
 
 
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestTheme(unittest.TestCase):
+    """QScintilla ignores the app palette, so every colour is set by hand."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self):
+        from raggy.app import MainWindow
+        w = MainWindow()
+        w._index_timer.stop()
+        w._find_timer.stop()
+        w.editor.setModified(False)
+        return w
+
+    def test_bgr_packing_is_blue_green_red(self):
+        # Scintilla wants 0xBBGGRR. Getting this wrong swaps red and blue with
+        # no error, so it is worth pinning.
+        from PyQt6.QtGui import QColor
+        from raggy.app import _bgr
+        self.assertEqual(_bgr(QColor("#FF0000")), 0x0000FF)   # red   -> low byte
+        self.assertEqual(_bgr(QColor("#0000FF")), 0xFF0000)   # blue  -> high byte
+        self.assertEqual(_bgr(QColor("#FFFFFF")), 0xFFFFFF)
+
+    def test_dark_mode_gives_a_bright_caret_on_a_dark_pane(self):
+        from PyQt6 import Qsci
+        w = self._window()
+        w._is_dark = lambda: True
+        w._apply_theme()
+        caret = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETCARETFORE)
+        self.assertEqual(caret, 0xFFFFFF, "caret must be bright against a dark pane")
+        self.assertLess(w.editor.paper().lightness(), 128, "pane should be dark")
+        self.assertGreater(w.editor.color().lightness(), 128, "text should be light")
+        w.close()
+
+    def test_light_mode_gives_a_dark_caret_on_a_light_pane(self):
+        from PyQt6 import Qsci
+        w = self._window()
+        w._is_dark = lambda: False
+        w._apply_theme()
+        caret = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETCARETFORE)
+        self.assertEqual(caret, 0x000000)
+        self.assertGreater(w.editor.paper().lightness(), 128)
+        w.close()
+
+    def test_theme_change_does_not_break_existing_results(self):
+        # Re-theming repaints indicators; it must not lose the search results.
+        w = self._window()
+        w.editor.setText("alpha beta gamma")
+        w.engine.index("alpha beta gamma", "t.txt")
+        w._indexed_text = "alpha beta gamma"
+        w.show_find()
+        w.find_bar.field.setText("beta")
+        w._find_timer.stop()
+        w._run_search()
+        before = len(w._results)
+        w._is_dark = lambda: True
+        w._apply_theme()
+        self.assertEqual(len(w._results), before)
+        w.editor.setModified(False)
+        w.close()
+
+
 if __name__ == "__main__":
     unittest.main()

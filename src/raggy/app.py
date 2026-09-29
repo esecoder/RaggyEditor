@@ -45,7 +45,7 @@ from raggy.engine import RaggyEngine
 try:
     from PyQt6 import Qsci
     from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QAction, QKeySequence
+    from PyQt6.QtGui import QAction, QColor, QKeySequence, QPalette
     from PyQt6.QtWidgets import (
         QApplication, QDialog, QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout,
         QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
@@ -64,6 +64,15 @@ MAX_EXACT = 2000
 UNTITLED = "Untitled"
 
 FIND_PLACEHOLDER = "Find — words, or describe what you mean"
+
+
+def _bgr(colour) -> int:
+    """QColor -> the 0xBBGGRR integer Scintilla expects.
+
+    ⚠️ Scintilla packs colours as BGR, not RGB. Passing an RGB value produces a
+    plausible-looking wrong colour (red and blue swapped), with no error.
+    """
+    return (colour.blue() << 16) | (colour.green() << 8) | colour.red()
 
 
 # =============================================================================
@@ -284,11 +293,20 @@ if HAS_QT:
 
             self._build_ui()
             self._build_menus()
-            self._setup_indicators()
+            self._apply_theme()
+            self._watch_theme()
             self._update_title()
 
             if path:
                 self.load_path(path)
+
+        def _watch_theme(self):
+            """Re-theme live when the user flips the system appearance."""
+            try:
+                QApplication.styleHints().colorSchemeChanged.connect(
+                    lambda _scheme: self._apply_theme())
+            except Exception:                                       # noqa: BLE001
+                pass
 
         # ------------------------------------------------------------------ UI
         def _build_ui(self):
@@ -336,17 +354,84 @@ if HAS_QT:
             except Exception:                                       # noqa: BLE001
                 pass
 
-        def _setup_indicators(self):
-            S = Qsci.QsciScintilla
-            for ind, colour in ((IND_EXACT, COL_EXACT), (IND_RELATED, COL_RELATED)):
+        # ------------------------------------------------------------- theming
+        def _is_dark(self) -> bool:
+            """Is the app currently in dark mode?
+
+            Qt 6.5+ reports the platform colour scheme directly. `Unknown` is
+            returned when the platform has no opinion (or in a headless/offscreen
+            run), so fall back to reading the palette the app was given.
+            """
+            try:
+                scheme = QApplication.styleHints().colorScheme()
+                if scheme == Qt.ColorScheme.Dark:
+                    return True
+                if scheme == Qt.ColorScheme.Light:
+                    return False
+            except Exception:                                       # noqa: BLE001
+                pass
+            window = self.palette().color(QPalette.ColorRole.Window)
+            return window.lightness() < 128
+
+        def _apply_theme(self):
+            """Colour the editor to match the platform, including the caret.
+
+            ⚠️ QScintilla does NOT follow the application palette: it keeps a
+            white background and a BLACK CARET whatever the system theme is. In
+            dark mode that leaves a black caret on a white pane, and a white pane
+            inside dark window chrome. Every colour below has to be set by hand.
+            """
+            dark = self._is_dark()
+            if dark:
+                paper = QColor("#1e1e1e")   # background
+                ink = QColor("#e8e8e8")     # text
+                caret = QColor("#ffffff")   # ⚠️ bright: a dark caret is invisible here
+                sel_bg, sel_fg = QColor("#2f5fa8"), QColor("#ffffff")
+                exact, related = 0x66D1FF, 0xFFA96A      # brighter, for a dark pane
+            else:
+                paper = QColor("#ffffff")
+                ink = QColor("#000000")
+                caret = QColor("#000000")
+                sel_bg, sel_fg = QColor("#b3d7ff"), QColor("#000000")
+                exact, related = COL_EXACT, COL_RELATED
+
+            e = self.editor
+            for setter, value in (
+                    (e.setPaper, paper), (e.setColor, ink),
+                    (e.setCaretForegroundColor, caret),
+                    (e.setSelectionBackgroundColor, sel_bg),
+                    (e.setSelectionForegroundColor, sel_fg),
+                    (e.setMarginsBackgroundColor, paper),
+                    (e.setMarginsForegroundColor, ink),
+                    (e.setCaretLineBackgroundColor, paper)):
                 try:
-                    self.editor.SendScintilla(S.SCI_INDICSETSTYLE, ind, S.INDIC_ROUNDBOX)
-                    self.editor.SendScintilla(S.SCI_INDICSETFORE, ind, colour)
-                    self.editor.SendScintilla(S.SCI_INDICSETALPHA, ind, 70)
-                    self.editor.SendScintilla(S.SCI_INDICSETOUTLINEALPHA, ind, 130)
-                    self.editor.SendScintilla(S.SCI_INDICSETUNDER, ind, 0)
+                    setter(value)
                 except Exception:                                   # noqa: BLE001
                     pass
+
+            # Default style + STYLECLEARALL, so any style QScintilla defaults to
+            # (rather than one we set) also takes the theme.
+            S = Qsci.QsciScintilla
+            try:
+                e.SendScintilla(S.SCI_STYLESETFORE, S.STYLE_DEFAULT, _bgr(ink))
+                e.SendScintilla(S.SCI_STYLESETBACK, S.STYLE_DEFAULT, _bgr(paper))
+                e.SendScintilla(S.SCI_STYLECLEARALL)
+                e.SendScintilla(S.SCI_SETCARETFORE, _bgr(caret))
+            except Exception:                                       # noqa: BLE001
+                pass
+
+            for ind, colour in ((IND_EXACT, exact), (IND_RELATED, related)):
+                try:
+                    e.SendScintilla(S.SCI_INDICSETSTYLE, ind, S.INDIC_ROUNDBOX)
+                    e.SendScintilla(S.SCI_INDICSETFORE, ind, colour)
+                    e.SendScintilla(S.SCI_INDICSETALPHA, ind, 70)
+                    e.SendScintilla(S.SCI_INDICSETOUTLINEALPHA, ind, 130)
+                    e.SendScintilla(S.SCI_INDICSETUNDER, ind, 0)
+                except Exception:                                   # noqa: BLE001
+                    pass
+
+            # Indicators are re-painted from the current colours.
+            self._highlight()
 
         def _build_menus(self):
             m = self.menuBar()
