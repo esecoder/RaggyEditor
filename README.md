@@ -6,24 +6,33 @@ Every editor's Find matches *characters*. That is exactly right for
 `ERR_CONN_4421` and exactly wrong for *"how do I stop the service falling over"* —
 a question that shares no words with the passage that answers it.
 
-RaggyEditor is a desktop text editor that keeps the ordinary Find and adds two
-things on top of it:
+RaggyEditor is a desktop text editor with **one search box**. Press `Cmd+F`, get
+a TextEdit-style find bar, and type — the same field returns the words you typed
+**and** the passages that mean the same thing:
 
-| | What it matches | Example |
-|---|---|---|
-| **Find** `Ctrl+F` | characters (regex) | `ERR_CONN_4421` |
-| **Semantic Find** `Ctrl+Shift+F` | meaning | *how do I stop it falling over?* |
-| **Ask** `Ctrl+Alt+A` | a grounded answer with citations — or an honest refusal | *why is adding workers not helping?* |
+| In the find bar | Result |
+|---|---|
+| `ERR_CONN_4421` | the exact matches, as any editor finds them |
+| *how do I stop it falling over?* | the passages about it, though they share no words |
+
+There is no separate "semantic search" mode to switch to and no extra panel.
+`Enter` / `Shift+Enter` (or the chevrons) walk through every match; the document
+highlights them; **Done** closes the bar.
+
+```
+Cmd+F  "how do I fix an expired certificate on a replica"
+  1 of 21   ·   0 exact · 21 related
+  → jumps to line 61:  "ERR_CONN_4422  The connection was established but the
+                        handshake did not complete…"
+     (ordinary Find for "expired certificate": nothing)
+```
 
 It runs **fully offline** with no API key, ships as a **single downloadable
 app**, and fetches its embedding model once, on request.
 
-```
-Ctrl+Shift+F  "how do I fix an expired certificate on a replica"
-  → #1  line 61  conf 0.83   ERR_CONN_4422  The connection was established but the
-                             handshake did not complete…
-     (plain Find for "expired certificate": 0 matches)
-```
+**Ask the Document** (`Cmd+Shift+A`) is there too, but as a menu command that
+opens a dialog — not a permanent pane. It answers with citations, or refuses
+when the answer is not in the document.
 
 ---
 
@@ -88,7 +97,7 @@ and Ask are ready.
 ./run.sh install      # .venv with the full app stack (engine + GUI + ONNX)
 ./run.sh app          # launch the editor
 ./run.sh demo         # offline engine tour — no GUI, no model, no key
-./run.sh test         # 64 tests
+./run.sh test         # 74 tests
 ```
 
 ### Just the engine, no Qt
@@ -254,12 +263,14 @@ answer.
 
 ## Verified / not verified
 
-✅ **64 tests pass** (`./run.sh test`), hermetic — no network, no model download.
+✅ **74 tests pass** (`./run.sh test`), hermetic — no network, no model download.
 ✅ The offset invariant (`chunk.text == document[start:end]`) is asserted in the
 chunker **and** tested for every strategy, so highlight-jump cannot drift.
-✅ **The GUI is tested headlessly** (`tests/test_app.py`): window construction,
-semantic Find, regex Find, click-to-select-the-exact-passage, low-confidence
-flagging, and the edit-debounce timer.
+✅ **The GUI is tested headlessly** (`tests/test_app.py`): the single-pane layout
+is guarded (a test fails if a tab widget or splitter returns), plus bar
+visibility, exact+related results in one list, regex toggle, bad-regex reporting,
+next/previous wrapping, use-selection-for-find, jump-to-exact-span, and the
+edit-debounce timer.
 ✅ Incremental re-index is asserted **identical to a cold rebuild**, and both
 cache-invalidation rules (different document, different encoder) are tested.
 ✅ **ONNX embeddings equal torch embeddings** (cosine 1.00000).
