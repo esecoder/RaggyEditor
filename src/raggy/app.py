@@ -54,6 +54,7 @@ from raggy import model_store
 from raggy.aiconfig import PROVIDERS, AIConfig
 from raggy.engine import RaggyEngine
 from raggy.offsets import OffsetMap
+from raggy.printing import footer_text, paginate, rows_for_document, rows_per_page
 
 try:
     from PyQt6 import Qsci
@@ -95,6 +96,28 @@ def _bgr(colour) -> int:
 # BACKGROUND WORK
 # =============================================================================
 if HAS_QT:
+
+    #: Set RAGGY_SETTINGS_DIR to keep window/zoom/recents state out of the user's
+    #: real preferences. The test suite uses it.
+    SETTINGS_DIR_ENV = "RAGGY_SETTINGS_DIR"
+
+    def app_settings() -> "QSettings":
+        """The application's settings store.
+
+        ⚠️ The environment override exists because `QSettings.setPath()` and
+        `setDefaultFormat()` are NOT enough on macOS: Qt resolves
+        `QSettings("Org", "App")` to NativeFormat there whatever the defaults say,
+        so a test run writes zoom size and recent-file lists into the developer's
+        real ~/Library/Preferences. That is how a test left `font_size = 72`
+        behind and made the next print job come out 28 pages long.
+
+        Passing an explicit INI path is the only reliable redirect.
+        """
+        override = os.environ.get(SETTINGS_DIR_ENV)
+        if override:
+            return QSettings(os.path.join(override, "raggyeditor.ini"),
+                             QSettings.Format.IniFormat)
+        return QSettings("RaggyEditor", "RaggyEditor")
 
     class Worker(QThread):
         done = pyqtSignal(object)
@@ -541,7 +564,7 @@ if HAS_QT:
             self._workers: list[QThread] = []
             self._ask_dialog: AskDialog | None = None
             self._offsets: OffsetMap | None = None
-            self._settings = QSettings("RaggyEditor", "RaggyEditor")
+            self._settings = app_settings()
             self._meaning_offer_made = bool(
                 self._settings.value("meaning_offer_made", False, type=bool))
             self.ai = AIConfig.load()
@@ -907,12 +930,78 @@ if HAS_QT:
             return ok
 
         # ----------------------------------------------------------- printing
-        def _document(self):
-            from PyQt6.QtGui import QTextDocument
-            doc = QTextDocument()
-            doc.setDefaultFont(self.editor.font())
-            doc.setPlainText(self.editor.text())
-            return doc
+        def _editor_wraps(self) -> bool:
+            try:
+                return self.editor.wrapMode() != Qsci.QsciScintilla.WrapMode.WrapNone
+            except Exception:                                       # noqa: BLE001
+                return True
+
+        def _document_name(self) -> str:
+            return os.path.basename(self.path) if self.path else UNTITLED
+
+        def _render_to_device(self, device) -> int:
+            """Draw the document onto a printer/PDF device, editor layout intact.
+
+            Uses the editor's font, wrap setting and tab width — the same three
+            things that decide where a line breaks on screen — so a printed line
+            number matches the line number in the window. See raggy.printing for
+            why QTextDocument was the wrong tool here.
+
+            Returns the number of pages written.
+            """
+            from PyQt6.QtGui import QFont, QPainter
+
+            painter = QPainter(device)
+            try:
+                painter.setFont(QFont(self.editor.font()))
+                fm = painter.fontMetrics()
+                page = device.pageLayout().paintRectPixels(device.resolution())
+                pad = max(8, page.width() // 40)          # a small, honest margin
+                left = page.left() + pad
+                max_width = page.width() - 2 * pad
+                line_h = max(1, fm.lineSpacing())
+                footer_h = int(fm.lineSpacing() * 2)
+                top = page.top() + fm.ascent() + pad // 2
+
+                rows = rows_for_document(
+                    self.editor.text(), fm.horizontalAdvance, max_width,
+                    wrap=self._editor_wraps(),
+                    tab_width=max(1, self.editor.tabWidth()))
+                per_page = rows_per_page(page.height(), line_h, footer_h)
+                pages = paginate(rows, per_page)
+
+                total = len(pages)
+                name = self._document_name()
+                for index, page_rows in enumerate(pages):
+                    if index:
+                        device.newPage()             # ⚠️ after the first page only
+                    y = top
+                    for row in page_rows:
+                        if row:
+                            painter.drawText(left, y, row)
+                        y += line_h
+
+                    painter.setFont(self._footer_font())
+                    painter.setPen(self._footer_colour())
+                    painter.drawText(
+                        left, page.bottom() - fm.descent(),
+                        footer_text(name, index + 1, total))
+                    painter.setFont(QFont(self.editor.font()))
+                return total
+            finally:
+                painter.end()
+
+        @staticmethod
+        def _footer_font():
+            from PyQt6.QtGui import QFont
+            font = QFont()
+            font.setPointSize(max(7, font.pointSize() - 3))
+            return font
+
+        @staticmethod
+        def _footer_colour():
+            from PyQt6.QtGui import QColor
+            return QColor("#666666")
 
         def print_document(self):
             from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
@@ -921,7 +1010,7 @@ if HAS_QT:
             dlg = QPrintDialog(printer, self)
             dlg.setWindowTitle("Print")
             if dlg.exec() == QDialog.DialogCode.Accepted:
-                self._document().print(printer)
+                self._render_to_device(printer)
 
         def export_pdf(self):
             from PyQt6.QtGui import QPdfWriter
@@ -937,7 +1026,7 @@ if HAS_QT:
             writer = QPdfWriter(p)
             writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
             try:
-                self._document().print(writer)
+                self._render_to_device(writer)
             except Exception as e:                                  # noqa: BLE001
                 QMessageBox.warning(self, APP_NAME, f"Could not export:\n{e}")
                 return

@@ -28,13 +28,13 @@ for _k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"):
 
 from raggy.app import HAS_QT  # noqa: E402
 
-if HAS_QT:
-    # ⚠️ Keep QSettings out of the developer's real preferences: route the default
-    # format into the same scratch directory used for XDG_CONFIG_HOME.
-    from PyQt6.QtCore import QSettings as _QSettings
-    _QSettings.setDefaultFormat(_QSettings.Format.IniFormat)
-    _QSettings.setPath(_QSettings.Format.IniFormat, _QSettings.Scope.UserScope,
-                       os.environ["XDG_CONFIG_HOME"])
+# ⚠️ Keep the app's settings out of the developer's real preferences.
+# QSettings.setPath()/setDefaultFormat() DO NOT WORK for this on macOS: Qt still
+# resolves QSettings("Org", "App") to NativeFormat and writes to
+# ~/Library/Preferences. A test run once left `font_size = 72` there, which made
+# the next print job come out 28 pages long. The app therefore honours an explicit
+# path override, and that is what these tests set.
+os.environ["RAGGY_SETTINGS_DIR"] = tempfile.mkdtemp(prefix="raggy-test-cfg-")
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SAMPLE = REPO / "samples" / "meridian-operations-handbook.txt"
@@ -701,6 +701,107 @@ class TestEditorFeatures(unittest.TestCase):
         from raggy.app import MainWindow
         text = MainWindow._format_answer({"mode": "retrieval_only"})
         self.assertIn("Set Up AI Answers", text)
+
+    # ---- printing ---------------------------------------------------------
+    def test_printed_row_matches_the_font_size_in_use(self):
+        # ⚠️ REGRESSION GUARD: the printer must use the EDITOR's font. If it falls
+        # back to a default while the editor has been zoomed, the printed page and
+        # the window disagree — which is exactly how a huge font produced 28 pages
+        # for a 3-page document and nobody noticed.
+        from PyQt6.QtGui import QPageSize, QPdfWriter
+        # Long enough to paginate, so the two font sizes give different counts.
+        w = self._window("\n".join(f"line {i}" for i in range(1, 401)))
+        for _ in range(8):
+            w.zoom_in()
+        big = w.editor.font().pointSize()
+        self.assertGreater(big, w._base_point_size())
+
+        import tempfile
+        path = tempfile.mktemp(suffix=".pdf")
+        writer = QPdfWriter(path)
+        writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+        pages_big = w._render_to_device(writer)
+
+        w.zoom_reset()
+        path2 = tempfile.mktemp(suffix=".pdf")
+        writer2 = QPdfWriter(path2)
+        writer2.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+        pages_small = w._render_to_device(writer2)
+
+        self.assertGreater(pages_big, pages_small,
+                           "a bigger font must take more pages")
+        w.editor.setModified(False)
+        w.close()
+
+    def test_export_writes_a_valid_pdf(self):
+        from PyQt6.QtGui import QPageSize, QPdfWriter
+        w = self._window("\n".join(f"line {i}" for i in range(1, 401)))
+        import tempfile
+        path = tempfile.mktemp(suffix=".pdf")
+        writer = QPdfWriter(path)
+        writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+        pages = w._render_to_device(writer)
+        self.assertGreaterEqual(pages, 1)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        self.assertTrue(data.startswith(b"%PDF"), "not a PDF")
+        self.assertGreater(len(data), 1000)
+        w.editor.setModified(False)
+        w.close()
+
+    def test_wrapping_off_keeps_printed_line_numbers_identical(self):
+        # A printed "line 61" must be line 61 in the window.
+        from PyQt6 import Qsci
+        from PyQt6.QtGui import QFontMetrics
+        from raggy.printing import rows_for_document
+        lines = [f"line {i}" for i in range(1, 201)]
+        w = self._window("\n".join(lines))
+        w.editor.setWrapMode(Qsci.QsciScintilla.WrapMode.WrapNone)
+        self.assertFalse(w._editor_wraps())
+        fm = QFontMetrics(w.editor.font())
+        rows = rows_for_document(w.editor.text(), fm.horizontalAdvance,
+                                 2000, wrap=w._editor_wraps())
+        self.assertEqual(rows, lines)
+        self.assertEqual(rows[60], "line 61")
+        w.editor.setModified(False)
+        w.close()
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestSettingsIsolation(unittest.TestCase):
+    """The suite must not touch the developer's real preferences.
+
+    ⚠️ This is not hypothetical. An earlier version relied on
+    `QSettings.setPath()`, which Qt IGNORES on macOS, so a test that zoomed wrote
+    `font_size = 72` into ~/Library/Preferences. The next print job then came out
+    28 pages long and the app opened with enormous text.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_settings_resolve_inside_the_override_directory(self):
+        from raggy.app import SETTINGS_DIR_ENV, app_settings
+        override = os.environ.get(SETTINGS_DIR_ENV)
+        self.assertTrue(override, "the suite must set the override")
+        self.assertTrue(app_settings().fileName().startswith(override),
+                        f"settings leaked to {app_settings().fileName()}")
+
+    def test_zoom_does_not_leak_out_of_the_override(self):
+        from raggy.app import app_settings
+        from raggy.app import MainWindow
+        w = MainWindow()
+        w._index_timer.stop()
+        w._find_timer.stop()
+        w.zoom_in()
+        app_settings().sync()
+        self.assertTrue(app_settings().fileName().startswith(
+            os.environ["RAGGY_SETTINGS_DIR"]))
+        w.zoom_reset()
+        w.editor.setModified(False)
+        w.close()
 
 
 if __name__ == "__main__":

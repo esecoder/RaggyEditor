@@ -63,6 +63,20 @@ meaning matches, the replace controls are disabled and say why.
 The replacement text is inserted literally: `\1` is not expanded, even in regular
 expression mode.
 
+### Printing mirrors the editor
+
+`Cmd+P` and **File ▸ Export as PDF…** render the document with the editor's own
+**font, wrap setting and tab width** — the three things that decide where a line
+breaks. The promise that matters: **with wrapping off, printed row N is document
+line N**, so a printed "line 61" matches line 61 in the window. There is a small
+page footer with the file name and `page n of m`.
+
+⚠️ The first version handed the text to Qt's `QTextDocument`, which prints *the
+text content* — it re-wraps at its own width, ignores the editor's wrap setting
+and indentation, and gives no way to keep the two in step. `raggy/printing.py`
+computes the layout instead, and takes the width measurement as an argument, so
+the wrapping and paging rules are unit-tested without a window or a printer.
+
 ### Answers need a model — and the app says so
 
 **Ask a Question About This Document…** (`Cmd+Shift+A`, under the Find menu) opens
@@ -177,7 +191,7 @@ from **Help ▸ Enable Search by Meaning…**.
 ./run.sh install      # .venv with the full app stack (engine + GUI + ONNX)
 ./run.sh app          # launch the editor
 ./run.sh demo         # offline engine tour — no GUI, no model, no key
-./run.sh test         # 130 tests
+./run.sh test         # 159 tests
 ```
 
 ### Just the engine, no Qt
@@ -343,9 +357,12 @@ answer.
 
 ## Verified / not verified
 
-✅ **130 tests pass** (`./run.sh test`), hermetic — no network, no model download,
-and QSettings/config redirected into a scratch directory so nothing touches your
-real preferences.
+✅ **159 tests pass** (`./run.sh test`), hermetic — no network, no model download,
+and the app's settings redirected into a scratch directory via
+`RAGGY_SETTINGS_DIR` so nothing touches your real preferences. ⚠️
+`QSettings.setPath()` is NOT enough on macOS: Qt ignores it and writes to
+`~/Library/Preferences` anyway, which is how a test once left `font_size = 72`
+behind.
 ✅ The offset invariant (`chunk.text == document[start:end]`) is asserted in the
 chunker **and** tested for every strategy, so highlight-jump cannot drift.
 ✅ ⚠️ **Character offsets are converted to UTF-8 byte offsets** at the Scintilla
