@@ -49,8 +49,10 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
+import uuid
 
-from raggy import model_store
+from raggy import model_store, recovery, textfile
 from raggy.aiconfig import PROVIDERS, AIConfig
 from raggy.engine import RaggyEngine
 from raggy.offsets import OffsetMap
@@ -449,8 +451,10 @@ if HAS_QT:
             row.addWidget(self.status)
 
             self.case_btn = self._toggle("Aa", "Match case")
+            self.word_btn = self._toggle("ab", "Whole words only")
             self.regex_btn = self._toggle(".*", "Regular expression")
             row.addWidget(self.case_btn)
+            row.addWidget(self.word_btn)
             row.addWidget(self.regex_btn)
 
             self.prev_btn = self._chevron("\u2039", "Previous match", self.prevRequested)
@@ -570,6 +574,19 @@ if HAS_QT:
             self.ai = AIConfig.load()
             self._apply_ai()
 
+            # The document's on-disk format, preserved across a save. See
+            # raggy.textfile for what goes wrong when it is not.
+            self.doc_format = textfile.DEFAULT_FORMAT
+            self._on_disk_format = textfile.DEFAULT_FORMAT
+            # ⚠️ `editor.setModified(True)` IS A SILENT NO-OP in this binding — it
+            # does not set QScintilla's modified flag (which is not SCI_GETMODIFY
+            # either). Only a real edit marks the document dirty. So a change that
+            # does not touch the buffer — converting line endings, restoring a
+            # snapshot — needs to be recorded here, or the app will happily close
+            # without saving it.
+            self._extra_dirty = False
+            self._untitled_key = uuid.uuid4().hex[:8]
+
             self._index_timer = QTimer(self)
             self._index_timer.setSingleShot(True)
             self._index_timer.setInterval(1200)
@@ -580,11 +597,17 @@ if HAS_QT:
             self._find_timer.setInterval(180)
             self._find_timer.timeout.connect(self._run_search)
 
+            # Autosave. Runs only while there are unsaved changes (see _snapshot).
+            self._save_timer = QTimer(self)
+            self._save_timer.setInterval(3000)
+            self._save_timer.timeout.connect(self._snapshot)
+
             self._build_ui()
             self._build_menus()
             self._apply_theme()
             self._apply_font()
             self._watch_theme()
+            self._restore_geometry()
             self._update_title()
 
             if path:
@@ -632,6 +655,7 @@ if HAS_QT:
             col.addWidget(self.find_bar)
             col.addWidget(self.editor, 1)
             self.setCentralWidget(central)
+            self.setAcceptDrops(True)        # drop a file on the window to open it
 
             self.editor.textChanged.connect(self._on_text_changed)
             try:
@@ -650,9 +674,21 @@ if HAS_QT:
             f.addSeparator()
             self._act(f, "&Save", QKeySequence.StandardKey.Save, self.save_file)
             self._act(f, "Save &As…", QKeySequence.StandardKey.SaveAs, self.save_as)
+            self._act(f, "Re&vert to Saved", None, self.revert_to_saved)
             f.addSeparator()
             self._act(f, "&Export as PDF…", None, self.export_pdf)
             self._act(f, "&Print…", QKeySequence.StandardKey.Print, self.print_document)
+            f.addSeparator()
+            eol = f.addMenu("Line &Endings")
+            self._eol_actions = {}
+            _platform = {"LF": "Unix", "CRLF": "Windows", "CR": "old Mac"}
+            for name, newline in (("LF", "\n"), ("CRLF", "\r\n"), ("CR", "\r")):
+                action = QAction(name + "  (" + _platform[name] + ")", self)
+                action.setCheckable(True)
+                action.triggered.connect(lambda _=False, nl=newline: self.set_line_ending(nl))
+                eol.addAction(action)
+                self._eol_actions[name] = action
+            self._update_line_ending_menu()
             f.addSeparator()
             self._act(f, "&Close", QKeySequence.StandardKey.Close, self.close)
 
@@ -679,6 +715,7 @@ if HAS_QT:
             self._act(d, "Find &Next", QKeySequence.StandardKey.FindNext, self._next)
             self._act(d, "Find &Previous", QKeySequence.StandardKey.FindPrevious, self._prev)
             self._act(d, "Use Selection for Find", "Ctrl+E", self._use_selection)
+            self._act(d, "&Jump to Selection", "Ctrl+J", self.jump_to_selection)
             d.addSeparator()
             self._act(d, "&Go to Line…", "Ctrl+L", self.go_to_line)
             d.addSeparator()
@@ -689,6 +726,10 @@ if HAS_QT:
             self._act(v, "Zoom &In", "Ctrl+=", self.zoom_in)
             self._act(v, "Zoom &Out", "Ctrl+-", self.zoom_out)
             self._act(v, "&Actual Size", "Ctrl+0", self.zoom_reset)
+
+            fmt = m.addMenu("F&ormat")
+            self._font_action = self._act(fmt, "&Font…", None, self.choose_font)
+            self._update_font_menu_label()
 
             h = m.addMenu("&Help")
             self._act(h, "Set Up AI Answers…", None, self.setup_ai)
@@ -798,12 +839,21 @@ if HAS_QT:
             return size if size > 0 else 13
 
         def _apply_font(self):
-            stored = self._settings.value("font_size", 0, type=int)
-            size = stored or self._base_point_size()
+            """The editor font = chosen family (or the system font) at the zoom size.
+
+            ⚠️ Family and size come from DIFFERENT places on purpose. The Format
+            menu sets the family; View ▸ Zoom sets the size. Reading the size back
+            from the dialog as well is how the two end up disagreeing.
+            """
+            size = self._settings.value("font_size", 0, type=int) or self._base_point_size()
+            family = self._settings.value("font_family", "", type=str)
             font = QApplication.font()
+            if family:
+                font.setFamily(family)
             if size > 0:
                 font.setPointSize(size)
             self.editor.setFont(font)
+            self._apply_theme()          # metrics changed; re-paint indicators
 
         def _set_font_size(self, size: int, remember: bool):
             size = max(8, min(72, size))
@@ -855,7 +905,7 @@ if HAS_QT:
         # --------------------------------------------------------------- files
         def _confirm_discard(self) -> bool:
             """Ask about unsaved changes. True means 'go ahead'."""
-            if not self.editor.isModified():
+            if not self._is_dirty():
                 return True
             r = QMessageBox.question(
                 self, APP_NAME, "Save changes before continuing?",
@@ -871,9 +921,16 @@ if HAS_QT:
             self.path = None
             self._indexed_text = ""
             self._offsets = None
+            # ⚠️ Reset the format too. Inheriting the previous document's encoding
+            # and line endings means "New" after opening a Windows file silently
+            # produces another Windows file.
+            self.doc_format = textfile.DEFAULT_FORMAT
             self.editor.setText("")
             self.editor.setModified(False)
+            self._mark_clean()
             self._update_title()
+            self._apply_eol_mode()
+            self._update_line_ending_menu()
             self._close_find()
             self.editor.setFocus()
 
@@ -886,34 +943,60 @@ if HAS_QT:
             if p:
                 self.load_path(p)
 
-        def load_path(self, path: str):
+        def load_path(self, path: str, warn_encoding: bool = True):
+            """Open a file, remembering its exact on-disk format."""
             try:
-                with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                    self.editor.setText(fh.read())
+                text, fmt, guessed = textfile.read(path)
             except Exception as e:                                  # noqa: BLE001
                 QMessageBox.warning(self, APP_NAME, f"Could not open:\n{e}")
                 return
+            self.editor.setText(text)
             self.path = path
+            self.doc_format = fmt
+            self._apply_eol_mode(fmt)
+            self._update_line_ending_menu()   # or the menu keeps the previous file's
             self._indexed_text = ""
             self._offsets = None
             self.editor.setModified(False)
+            self._mark_clean()
             self._update_title()
             self._remember_recent(path)
             self._index_document()
             if self.find_bar.isVisible() and self.find_bar.query():
                 self._run_search()
 
+            # ⚠️ Say so rather than pretending we understood the file. A wrong guess
+            # means saving would write a different encoding back than we read.
+            if guessed and warn_encoding:
+                QMessageBox.information(
+                    self, "Opened as " + fmt.encoding,
+                    f"This file is not valid UTF-8, so it has been opened as "
+                    f"{fmt.encoding}.\n\nIt will be saved back as {fmt.encoding} "
+                    f"with {fmt.newline_name} line endings, unchanged.")
+
+        def _apply_eol_mode(self, fmt=None):
+            """Tell Scintilla which line ending this document uses, for display."""
+            fmt = fmt or self.doc_format
+            try:
+                self.editor.setEolMode(textfile.EOL_MODE.get(fmt.newline, 2))
+            except Exception:                                       # noqa: BLE001
+                pass
+
         def save_file(self) -> bool:
             if not self.path:
                 return self.save_as()
             try:
-                with open(self.path, "w", encoding="utf-8") as fh:
-                    fh.write(self.editor.text())
+                # ⚠️ Writes the document's OWN encoding and newline style. A
+                # plain open(..., "w") here is what silently turned Windows files
+                # into LF and Latin-1 files into UTF-8.
+                textfile.write(self.path, self.editor.text(), self.doc_format)
             except Exception as e:                                  # noqa: BLE001
                 QMessageBox.warning(self, APP_NAME, f"Could not save:\n{e}")
                 return False
             self.editor.setModified(False)
+            self._mark_clean()               # format changes count as saved too
             self._remember_recent(self.path)
+            self._forget_snapshot()          # safely on disk; the net is not needed
             return True
 
         def save_as(self) -> bool:
@@ -928,6 +1011,118 @@ if HAS_QT:
             if ok:
                 self._update_title()
             return ok
+
+        # ------------------------------------------------------- doc format
+        def set_line_ending(self, newline: str):
+            """Convert the document to a different newline style, deliberately."""
+            if newline == self.doc_format.newline:
+                return
+            self.doc_format = textfile.TextFormat(self.doc_format.encoding, newline,
+                                                  self.doc_format.bom)
+            self._apply_eol_mode()
+            self._mark_dirty()                # the file will differ from disk
+            self._update_line_ending_menu()
+
+        def _is_dirty(self) -> bool:
+            """Has anything changed since the last save?
+
+            ⚠️ Not just `editor.isModified()`: a format change or a restored
+            snapshot never touches the buffer, and `setModified(True)` cannot mark
+            it. See the note in __init__.
+            """
+            return bool(self.editor.isModified()) or self._extra_dirty
+
+        def _mark_dirty(self):
+            self._extra_dirty = True
+            self.setWindowModified(True)
+
+        def _mark_clean(self):
+            """The document now matches what is on disk. Clears BOTH dirty flags.
+
+            ⚠️ Clearing only `_extra_dirty` leaves QScintilla's own flag set, so the
+            document still looks unsaved and the app prompts on close.
+            """
+            self.editor.setModified(False)
+            self._extra_dirty = False
+            self._on_disk_format = self.doc_format
+            self.setWindowModified(False)
+
+        def _update_line_ending_menu(self):
+            for name, action in getattr(self, "_eol_actions", {}).items():
+                action.setChecked(name == self.doc_format.newline_name)
+
+        def revert_to_saved(self):
+            """Throw away changes and reload the file from disk."""
+            if not self.path:
+                return
+            if self._is_dirty():
+                r = QMessageBox.question(
+                    self, APP_NAME,
+                    "Discard all changes and reload from disk?",
+                    QMessageBox.StandardButton.Discard
+                    | QMessageBox.StandardButton.Cancel)
+                if r != QMessageBox.StandardButton.Discard:
+                    return
+            self.load_path(self.path, warn_encoding=False)
+            self._forget_snapshot()
+
+        # ------------------------------------------------------- autosave
+        def _snapshot_slot(self) -> str:
+            return recovery.slot_id(self.path, self._untitled_key)
+
+        def _snapshot(self):
+            """Write a recovery snapshot if — and only if — there is work to lose."""
+            if not self._is_dirty():
+                self._save_timer.stop()       # nothing to lose; save the wake-ups
+                return
+            text = self.editor.text()
+            if not text.strip():
+                return
+            try:
+                recovery.save(recovery.Snapshot(
+                    slot=self._snapshot_slot(),
+                    text=text,
+                    path=self.path,
+                    encoding=self.doc_format.encoding,
+                    newline=self.doc_format.newline,
+                    bom=self.doc_format.bom))
+            except Exception:                                       # noqa: BLE001
+                pass          # a failed safety net must never interrupt typing
+
+        def _forget_snapshot(self):
+            try:
+                recovery.clear(self._snapshot_slot())
+            except Exception:                                       # noqa: BLE001
+                pass
+
+        def restore_snapshot(self, snap):
+            """Put a recovered document back in the editor."""
+            self.editor.setText(snap.text)
+            self.path = snap.path
+            self.doc_format = snap.text_format()
+            self._apply_eol_mode()
+            self._indexed_text = ""
+            self._offsets = None
+            self._mark_dirty()                   # it is NOT what is on disk
+            self._update_title()
+            self._update_line_ending_menu()
+            self._index_document()
+
+        # ------------------------------------------------------- geometry
+        def _restore_geometry(self):
+            saved = self._settings.value("geometry")
+            if saved:
+                try:
+                    self.restoreGeometry(saved)
+                except Exception:                                   # noqa: BLE001
+                    pass
+
+        def _save_geometry(self):
+            try:
+                self._settings.setValue("geometry", self.saveGeometry())
+            except Exception:                                       # noqa: BLE001
+                pass
+
 
         # ----------------------------------------------------------- printing
         def _editor_wraps(self) -> bool:
@@ -1090,6 +1285,8 @@ if HAS_QT:
         def _on_text_changed(self):
             self._offsets = None
             self._index_timer.start()
+            if not self._save_timer.isActive():
+                self._save_timer.start()      # autosave, while there are changes
 
         def _index_document(self):
             text = self.editor.text()
@@ -1191,6 +1388,13 @@ if HAS_QT:
         def _exact_matches(self, query: str) -> list[dict] | None:
             flags = 0 if self.find_bar.case_btn.isChecked() else re.IGNORECASE
             pattern = query if self.find_bar.regex_btn.isChecked() else re.escape(query)
+            if self.find_bar.word_btn.isChecked():
+                # ⚠️ Lookarounds, not \b: \b is defined against word characters, so
+                # searching for "(beta)" as a whole word with \b...(\)\b can never
+                # match — the closing ")" is not a word character, so there is no
+                # boundary after it. "Not preceded/followed by a word character" is
+                # the rule people actually mean.
+                pattern = r"(?<!\w)" + pattern + r"(?!\w)"
             try:
                 rx = re.compile(pattern, flags)
             except re.error as e:
@@ -1325,6 +1529,50 @@ if HAS_QT:
             if ok:
                 self.editor.SendScintilla(Qsci.QsciScintilla.SCI_GOTOLINE, n - 1)
                 self.editor.setFocus()
+
+        def jump_to_selection(self):
+            """Scroll so the current selection is visible, without moving it.
+
+            ⚠️ ensureLineVisible only ever scrolls the MINIMUM amount, so on a long
+            jump it can leave the caret at the very edge of the viewport. Scrolling
+            to the line first and then revealing the caret gives a little context.
+            """
+            S = Qsci.QsciScintilla
+            try:
+                start, end = self._sel_chars()
+                if start == end:
+                    return
+                line = self.editor.SendScintilla(
+                    S.SCI_LINEFROMPOSITION, self._om().to_byte(start))
+                # A few lines of context above, then make sure the caret is shown.
+                self.editor.SendScintilla(S.SCI_SETFIRSTVISIBLELINE, max(0, line - 3))
+                self.editor.ensureLineVisible(line)
+                self.editor.setFocus()
+            except Exception:                                       # noqa: BLE001
+                pass
+
+        def choose_font(self):
+            """Pick the document font. Size stays with the View menu's zoom."""
+            from PyQt6.QtWidgets import QFontDialog
+            font, ok = QFontDialog.getFont(self.editor.font(), self, "Document Font")
+            if not ok:
+                return
+            # ⚠️ QFontDialog returns a size too. Zoom and the font size are the same
+            # number, so taking the dialog's size as well would make the two
+            # disagree the moment either changed. The dialog sets the family; zoom
+            # owns the size.
+            family = font.family()
+            self._settings.setValue("font_family", family)
+            self._apply_font()
+            self._update_font_menu_label()
+
+        def _update_font_menu_label(self):
+            action = getattr(self, "_font_action", None)
+            if action:
+                action.setText("&Font…   (" + self._font_family() + ")")
+
+        def _font_family(self) -> str:
+            return self._settings.value("font_family", "", type=str) or "System"
 
         # ------------------------------------------------- meaning search offer
         def _should_offer_meaning(self) -> bool:
@@ -1480,11 +1728,29 @@ if HAS_QT:
             w.finished.connect(
                 lambda: self._workers.remove(w) if w in self._workers else None)
 
+        # ------------------------------------------------------------ dragging
+        def dragEnterEvent(self, event):
+            if event.mimeData().hasUrls() and any(
+                    u.isLocalFile() for u in event.mimeData().urls()):
+                event.acceptProposedAction()
+
+        def dropEvent(self, event):
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    if self._confirm_discard():
+                        self.load_path(url.toLocalFile())
+                    event.acceptProposedAction()
+                    return
+
         def closeEvent(self, event):
-            if self._confirm_discard():
-                event.accept()
-            else:
+            if not self._confirm_discard():
                 event.ignore()
+                return
+            # Saved, or the user chose to discard: the snapshot is no longer needed.
+            self._forget_snapshot()
+            self._save_timer.stop()
+            self._save_geometry()
+            event.accept()
 
 else:  # pragma: no cover
 
@@ -1499,6 +1765,44 @@ else:  # pragma: no cover
 
     class AISetupDialog:  # type: ignore
         pass
+
+
+def _offer_recovery(win) -> None:
+    """Offer unsaved work from a previous session, if any survived.
+
+    ⚠️ Runs AFTER the window is shown, and only offers snapshots that are newer
+    than what is on disk. Restoring a stale snapshot would silently roll the user
+    backwards — worse than not offering at all.
+    """
+    try:
+        pending = recovery.pending()
+    except Exception:                                               # noqa: BLE001
+        return
+    if not pending:
+        return
+
+    lines = []
+    for snap in pending[:8]:
+        when = time.strftime("%H:%M", time.localtime(snap.taken_at))
+        lines.append(f"  • {snap.name}   (unsaved at {when})")
+    extra = len(pending) - len(lines)
+    if extra > 0:
+        lines.append(f"  …and {extra} more")
+
+    r = QMessageBox.question(
+        win, "Recover Unsaved Work",
+        "RaggyEditor closed unexpectedly and has unsaved changes:\n\n"
+        + "\n".join(lines)
+        + "\n\nRecover the most recent one?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        | QMessageBox.StandardButton.Discard)
+    if r == QMessageBox.StandardButton.Yes:
+        win.restore_snapshot(pending[0])
+    elif r == QMessageBox.StandardButton.Discard:
+        try:
+            recovery.clear_all()
+        except Exception:                                           # noqa: BLE001
+            pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1520,6 +1824,8 @@ def main(argv: list[str] | None = None) -> int:
         print("selftest: window constructed OK")
         QTimer.singleShot(0, app.quit)
         return app.exec()
+    if not path:
+        QTimer.singleShot(0, lambda: _offer_recovery(win))
     return app.exec()
 
 

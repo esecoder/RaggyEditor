@@ -35,6 +35,8 @@ from raggy.app import HAS_QT  # noqa: E402
 # the next print job come out 28 pages long. The app therefore honours an explicit
 # path override, and that is what these tests set.
 os.environ["RAGGY_SETTINGS_DIR"] = tempfile.mkdtemp(prefix="raggy-test-cfg-")
+# Recovery snapshots go to a scratch directory too, for the same reason.
+os.environ["RAGGY_RECOVERY_DIR"] = tempfile.mkdtemp(prefix="raggy-test-rec-")
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SAMPLE = REPO / "samples" / "meridian-operations-handbook.txt"
@@ -79,7 +81,7 @@ class TestDesktopApp(unittest.TestCase):
     def test_menu_bar_carries_no_implementation_jargon(self):
         w = self._window()
         menus = [a.text().replace("&", "") for a in w.menuBar().actions()]
-        self.assertEqual(menus, ["File", "Edit", "Find", "View", "Help"])
+        self.assertEqual(menus, ["File", "Edit", "Find", "View", "Format", "Help"])
         # ⚠️ "Model" was a menu of encoder choices (auto/onnx/neural/lsa). It must
         # never come back: those are words about the implementation, not the
         # document. "View" is fine — it holds only zoom.
@@ -246,7 +248,7 @@ class TestDesktopApp(unittest.TestCase):
         with mock.patch("raggy.app.QMessageBox.question",
                         return_value=QMessageBox.StandardButton.Discard):
             self.assertTrue(w._confirm_discard())
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     # ---- the meaning-search offer ----------------------------------------
@@ -446,7 +448,7 @@ class TestTheme(unittest.TestCase):
         w._is_dark = lambda: True
         w._apply_theme()
         self.assertEqual(len(w._results), before)
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
 
@@ -487,7 +489,7 @@ class TestEditorFeatures(unittest.TestCase):
         self._search(w, "ERR_X")
         w._do_replace("ERR_Y", True)
         self.assertEqual(w.editor.text(), "alpha ERR_Y beta ERR_Y gamma\n")
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     def test_replace_one_replaces_only_the_current_match(self):
@@ -496,7 +498,7 @@ class TestEditorFeatures(unittest.TestCase):
         w._do_replace("ERR_Y", False)
         self.assertEqual(w.editor.text().count("ERR_Y"), 1)
         self.assertEqual(w.editor.text().count("ERR_X"), 1)
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     def test_replace_is_refused_when_only_meaning_matches_exist(self):
@@ -510,7 +512,7 @@ class TestEditorFeatures(unittest.TestCase):
         before = w.editor.text()
         w._do_replace("XXX", True)
         self.assertEqual(w.editor.text(), before, "it replaced a meaning match!")
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     def test_replace_respects_case_sensitivity(self):
@@ -519,7 +521,7 @@ class TestEditorFeatures(unittest.TestCase):
         self._search(w, "ERR_X")
         w._do_replace("Z", True)
         self.assertEqual(w.editor.text(), "Err_x and Z here\n")
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     # ---- the offset regression -------------------------------------------
@@ -537,7 +539,7 @@ class TestEditorFeatures(unittest.TestCase):
         selected = text.encode("utf-8")[b0:b1].decode("utf-8")
         self.assertEqual(selected, "ERR_CONN_4421",
                          f"editor selected {selected!r} instead of the match")
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     def test_replace_is_correct_after_multibyte_characters(self):
@@ -546,7 +548,7 @@ class TestEditorFeatures(unittest.TestCase):
         self._search(w, "ERR_X")
         w._do_replace("OK", True)
         self.assertEqual(w.editor.text(), "café ☕ OK and OK\n")
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     # ---- zoom -------------------------------------------------------------
@@ -560,7 +562,7 @@ class TestEditorFeatures(unittest.TestCase):
         self.assertEqual(w.editor.font().pointSize(), base - 1)
         w.zoom_reset()
         self.assertEqual(w.editor.font().pointSize(), w._base_point_size())
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     def test_zoom_is_clamped(self):
@@ -568,7 +570,7 @@ class TestEditorFeatures(unittest.TestCase):
         for _ in range(200):
             w.zoom_in()
         self.assertLessEqual(w.editor.font().pointSize(), 72)
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     # ---- go to line -------------------------------------------------------
@@ -580,7 +582,7 @@ class TestEditorFeatures(unittest.TestCase):
         pos = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETCURRENTPOS)
         line = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_LINEFROMPOSITION, pos)
         self.assertEqual(line, 2)              # 0-based: the third line
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     def test_go_to_line_cancelled_changes_nothing(self):
@@ -592,7 +594,7 @@ class TestEditorFeatures(unittest.TestCase):
             w.go_to_line()
         self.assertEqual(w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETCURRENTPOS),
                          before)
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     # ---- transformations --------------------------------------------------
@@ -605,7 +607,7 @@ class TestEditorFeatures(unittest.TestCase):
         w.editor.SendScintilla(Qsci.QsciScintilla.SCI_SETSEL, 0, 5)
         w.transform_case("lower")
         self.assertEqual(w.editor.text(), "hello world")
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     def test_transformation_with_no_selection_applies_to_the_whole_document(self):
@@ -614,7 +616,7 @@ class TestEditorFeatures(unittest.TestCase):
         w.editor.SendScintilla(Qsci.QsciScintilla.SCI_SETSEL, 0, 0)
         w.transform_case("upper")
         self.assertEqual(w.editor.text(), "HELLO WORLD")
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     # ---- recent files -----------------------------------------------------
@@ -629,7 +631,7 @@ class TestEditorFeatures(unittest.TestCase):
         labels = [a.text() for a in w.recent_menu.actions() if a.text()]
         self.assertTrue(any("a.txt" in x for x in labels))
         self.assertIn("Clear Menu", labels)
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     # ---- AI setup ---------------------------------------------------------
@@ -730,7 +732,7 @@ class TestEditorFeatures(unittest.TestCase):
 
         self.assertGreater(pages_big, pages_small,
                            "a bigger font must take more pages")
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     def test_export_writes_a_valid_pdf(self):
@@ -746,7 +748,7 @@ class TestEditorFeatures(unittest.TestCase):
             data = fh.read()
         self.assertTrue(data.startswith(b"%PDF"), "not a PDF")
         self.assertGreater(len(data), 1000)
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     def test_wrapping_off_keeps_printed_line_numbers_identical(self):
@@ -763,7 +765,7 @@ class TestEditorFeatures(unittest.TestCase):
                                  2000, wrap=w._editor_wraps())
         self.assertEqual(rows, lines)
         self.assertEqual(rows[60], "line 61")
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
 
@@ -800,8 +802,453 @@ class TestSettingsIsolation(unittest.TestCase):
         self.assertTrue(app_settings().fileName().startswith(
             os.environ["RAGGY_SETTINGS_DIR"]))
         w.zoom_reset()
-        w.editor.setModified(False)
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
+
+
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestDocumentIntegrity(unittest.TestCase):
+    """Opening and saving must not change the file. See raggy.textfile."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _window(self):
+        from raggy.app import MainWindow
+        w = MainWindow()
+        w._index_timer.stop()
+        w._find_timer.stop()
+        w._save_timer.stop()
+        w.editor.setModified(False)
+        return w
+
+    def _file(self, name, raw: bytes) -> str:
+        path = pathlib.Path(self.tmp.name, name)
+        path.write_bytes(raw)
+        return str(path)
+
+    # ---- the bug that started this ----
+    def test_a_crlf_file_keeps_its_line_endings_after_saving(self):
+        path = self._file("win.txt", b"one\r\ntwo\r\n")
+        w = self._window()
+        w.load_path(path, warn_encoding=False)
+        w.editor.setText(w.editor.text() + "three\n")
+        w.editor.setModified(True)
+        self.assertTrue(w.save_file())
+        self.assertEqual(pathlib.Path(path).read_bytes(), b"one\r\ntwo\r\nthree\r\n")
+        w.close()
+
+    def test_a_latin1_file_is_not_silently_converted_to_utf8(self):
+        path = self._file("latin.txt", "caf\u00e9\n".encode("latin-1"))
+        w = self._window()
+        w.load_path(path, warn_encoding=False)
+        self.assertEqual(w.doc_format.encoding, "latin-1")
+        w.editor.setModified(True)
+        w.save_file()
+        self.assertIn(b"caf\xe9", pathlib.Path(path).read_bytes())
+        self.assertNotIn(b"caf\xc3\xa9", pathlib.Path(path).read_bytes())
+        w.close()
+
+    def test_an_untouched_file_survives_open_and_save_byte_for_byte(self):
+        for name, raw in {
+                "unix.txt": b"a\nb\n",
+                "win.txt": b"a\r\nb\r\n",
+                "bom.txt": b"\xef\xbb\xbfa\nb\n",
+                "latin.txt": "caf\u00e9\r\n".encode("latin-1"),
+        }.items():
+            with self.subTest(name=name):
+                path = self._file(name, raw)
+                w = self._window()
+                w.load_path(path, warn_encoding=False)
+                w.editor.setModified(True)      # a save the user asked for
+                self.assertTrue(w.save_file())
+                self.assertEqual(pathlib.Path(path).read_bytes(), raw)
+                w.close()
+
+    def test_the_editor_buffer_never_holds_a_carriage_return(self):
+        path = self._file("win.txt", b"a\r\nb\r\n")
+        w = self._window()
+        w.load_path(path, warn_encoding=False)
+        self.assertNotIn("\r", w.editor.text())
+        w.close()
+
+    # ---- the menu must tell the truth ----
+    def test_the_line_ending_menu_follows_the_opened_file(self):
+        path = self._file("win.txt", b"a\r\nb\r\n")
+        w = self._window()
+        w.load_path(path, warn_encoding=False)
+        checked = [k for k, a in w._eol_actions.items() if a.isChecked()]
+        self.assertEqual(checked, ["CRLF"], "the menu did not follow the document")
+        w.close()
+
+    def test_new_resets_the_format_instead_of_inheriting_it(self):
+        # Otherwise "New" after opening a Windows file makes another Windows file.
+        path = self._file("win.txt", b"a\r\nb\r\n")
+        w = self._window()
+        w.load_path(path, warn_encoding=False)
+        w.editor.setModified(False)
+        w.new_file()
+        self.assertEqual(w.doc_format.newline_name, "LF")
+        self.assertEqual([k for k, a in w._eol_actions.items() if a.isChecked()],
+                         ["LF"])
+        w.close()
+
+    def test_converting_line_endings_is_a_deliberate_edit(self):
+        path = self._file("unix.txt", b"a\nb\n")
+        w = self._window()
+        w.load_path(path, warn_encoding=False)
+        self.assertFalse(w.editor.isModified())
+        w.set_line_ending("\r\n")
+        # ⚠️ `_is_dirty()`, not `editor.isModified()`: converting line endings does
+        # not touch the buffer, and QScintilla's setModified(True) does nothing.
+        self.assertTrue(w._is_dirty(), "a format change must look unsaved")
+        self.assertTrue(w.windowTitle())     # and the title keeps its [*] marker
+        w.save_file()
+        self.assertEqual(pathlib.Path(path).read_bytes(), b"a\r\nb\r\n")
+        w.close()
+
+    def test_a_non_utf8_file_is_reported(self):
+        path = self._file("latin.txt", "caf\u00e9\n".encode("latin-1"))
+        w = self._window()
+        with mock.patch("raggy.app.QMessageBox.information") as info:
+            w.load_path(path)
+        self.assertTrue(info.called, "the user was not told about the encoding")
+        w.close()
+
+    def test_a_utf8_file_is_not_reported(self):
+        path = self._file("plain.txt", b"hello\n")
+        w = self._window()
+        with mock.patch("raggy.app.QMessageBox.information") as info:
+            w.load_path(path)
+        self.assertFalse(info.called, "an ordinary file should open silently")
+        w.close()
+
+    def test_revert_to_saved_restores_the_file_on_disk(self):
+        path = self._file("doc.txt", b"original\n")
+        w = self._window()
+        w.load_path(path, warn_encoding=False)
+        w.editor.setText("changed")
+        w.editor.setModified(True)
+        with mock.patch("raggy.app.QMessageBox.question",
+                        return_value=__import__("PyQt6.QtWidgets",
+                                                fromlist=["QMessageBox"])
+                        .QMessageBox.StandardButton.Discard):
+            w.revert_to_saved()
+        self.assertEqual(w.editor.text(), "original\n")
+        self.assertFalse(w.editor.isModified())
+        w.close()
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestAutosave(unittest.TestCase):
+    """Unsaved work must survive a crash, and must not be offered when stale."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from raggy import recovery
+        recovery.clear_all()
+        self.addCleanup(recovery.clear_all)
+
+    def _window(self, text="some text"):
+        from raggy.app import MainWindow
+        w = MainWindow()
+        w._index_timer.stop()
+        w._find_timer.stop()
+        w._save_timer.stop()
+        w.editor.setText(text)
+        w.editor.setModified(True)
+        return w
+
+    def test_a_snapshot_is_written_while_there_are_unsaved_changes(self):
+        from raggy import recovery
+        w = self._window("work in progress")
+        w._snapshot()
+        pending = recovery.list_all()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].text, "work in progress")
+        w._mark_clean()      # clears BOTH dirty flags
+        w.close()
+
+    def test_nothing_is_written_when_the_document_is_saved(self):
+        from raggy import recovery
+        w = self._window("clean")
+        w.editor.setModified(False)
+        w._snapshot()
+        self.assertEqual(recovery.list_all(), [])
+        w.close()
+
+    def test_an_empty_document_is_not_snapshotted(self):
+        from raggy import recovery
+        w = self._window("   \n  ")
+        w._snapshot()
+        self.assertEqual(recovery.list_all(), [])
+        w._mark_clean()      # clears BOTH dirty flags
+        w.close()
+
+    def test_saving_forgets_the_snapshot(self):
+        from raggy import recovery
+        path = pathlib.Path(tempfile.mkdtemp(), "doc.txt")
+        path.write_text("v1", encoding="utf-8")
+        w = self._window("v2 unsaved")
+        w.path = str(path)
+        w._snapshot()
+        self.assertEqual(len(recovery.list_all()), 1)
+        w.save_file()
+        self.assertEqual(recovery.list_all(), [])
+        w.close()
+
+    def test_editing_starts_the_autosave_timer(self):
+        w = self._window("x")
+        w._save_timer.stop()
+        w.editor.setText("typed")
+        self.assertTrue(w._save_timer.isActive())
+        w._mark_clean()      # clears BOTH dirty flags
+        w.close()
+
+    def test_the_timer_stops_once_there_is_nothing_to_lose(self):
+        w = self._window("x")
+        w.editor.setModified(False)
+        w._snapshot()
+        self.assertFalse(w._save_timer.isActive())
+        w.close()
+
+    def test_a_snapshot_restores_the_text_and_the_format(self):
+        w = self._window("recovered body")
+        w.editor.setModified(False)       # new_file() would otherwise prompt to save
+        w.new_file()                      # back to a clean LF document
+        snap = __import__("raggy.recovery", fromlist=["x"]).Snapshot(
+            slot="s", text="recovered body", path=None, newline="\r\n")
+        w.restore_snapshot(snap)
+        self.assertEqual(w.editor.text(), "recovered body")
+        self.assertEqual(w.doc_format.newline_name, "CRLF")
+        self.assertTrue(w.editor.isModified(), "a restored document is unsaved")
+        w._mark_clean()      # clears BOTH dirty flags
+        w.close()
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestTierTwo(unittest.TestCase):
+    """Whole-word, jump to selection, font, geometry, drag and drop."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self, text="cat category cat\n"):
+        from raggy.app import MainWindow
+        w = MainWindow()
+        w.zoom_reset()
+        w._index_timer.stop()
+        w._find_timer.stop()
+        w._save_timer.stop()
+        w.editor.setText(text)
+        w._offsets = None
+        w.editor.setModified(False)
+        return w
+
+    def _matches(self, w, query):
+        w.show_find()
+        w.find_bar.field.setText(query)
+        w._find_timer.stop()
+        w._run_search()
+        return [r for r in w._results if r["kind"] == "match"]
+
+    def test_whole_word_excludes_substrings(self):
+        w = self._window()
+        loose = self._matches(w, "cat")
+        w.find_bar.word_btn.setChecked(True)
+        tight = self._matches(w, "cat")
+        self.assertEqual(len(loose), 3)
+        self.assertEqual(len(tight), 2)
+        w.close()
+
+    def test_whole_word_does_not_break_on_punctuation(self):
+        # \b would fail here: there is no word boundary after ")".
+        w = self._window("x (beta) y beta z\n")
+        w.find_bar.word_btn.setChecked(True)
+        self.assertEqual(len(self._matches(w, "(beta)")), 1)
+        w.close()
+
+    def test_jump_to_selection_scrolls_without_moving_the_selection(self):
+        from PyQt6 import Qsci
+        w = self._window("line\n" * 400)
+        w.show()
+        start, end = w._sel_chars()
+        w._select_chars(2000, 2004)
+        before = (w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSELECTIONSTART),
+                  w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSELECTIONEND))
+        w.jump_to_selection()
+        after = (w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSELECTIONSTART),
+                 w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSELECTIONEND))
+        self.assertEqual(before, after, "jumping moved the selection")
+        visible = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETFIRSTVISIBLELINE)
+        self.assertGreater(visible, 0, "it did not scroll")
+        _ = (start, end)
+        w.close()
+
+    def test_jump_with_no_selection_does_nothing(self):
+        w = self._window("a\nb\n")
+        w._select_chars(0, 0)
+        w.jump_to_selection()               # must not raise
+        w.close()
+
+    def test_the_font_menu_sets_the_family_and_leaves_zoom_alone(self):
+        from PyQt6.QtGui import QFont
+        w = self._window()
+        w.zoom_in()
+        size_before = w.editor.font().pointSize()
+        with mock.patch("PyQt6.QtWidgets.QFontDialog.getFont",
+                        return_value=(QFont("Courier New", 40), True)):
+            w.choose_font()
+        self.assertEqual(w.editor.font().family(), "Courier New")
+        self.assertEqual(w.editor.font().pointSize(), size_before,
+                         "the dialog's size leaked into zoom")
+        self.assertIn("Courier New", w._font_action.text())
+        w.close()
+
+    def test_cancelling_the_font_dialog_changes_nothing(self):
+        from PyQt6.QtGui import QFont
+        w = self._window()
+        before = w.editor.font().family()
+        with mock.patch("PyQt6.QtWidgets.QFontDialog.getFont",
+                        return_value=(QFont("Courier New", 40), False)):
+            w.choose_font()
+        self.assertEqual(w.editor.font().family(), before)
+        w.close()
+
+    def test_the_window_geometry_is_remembered(self):
+        # ⚠️ Compare two RESTORED windows against each other, not a restored one
+        # against the window that saved. A programmatic resize may exceed the
+        # (offscreen) screen, while restoreGeometry clamps to it — comparing
+        # across would fail on platform clamping rather than on the feature.
+        from PyQt6.QtCore import QSize
+        w = self._window()
+        w.resize(820, 600)
+        w._save_geometry()
+        self.assertTrue(w._settings.value("geometry"), "nothing was stored")
+
+        w2 = self._window()
+        w2._restore_geometry()
+        w3 = self._window()
+        w3._restore_geometry()
+        self.assertEqual(w2.size(), w3.size(), "geometry was not remembered")
+        self.assertNotEqual(w2.size(), QSize(980, 720),
+                            "fell back to the default size")
+        w._mark_clean()
+        w.close()
+        w2.close()
+        w3.close()
+
+    def test_dropping_a_file_loads_it(self):
+        from PyQt6.QtCore import QMimeData, QPointF, QUrl, Qt
+        from PyQt6.QtGui import QDropEvent
+        path = pathlib.Path(tempfile.mkdtemp(), "dropped.txt")
+        path.write_text("dropped content\n", encoding="utf-8")
+        w = self._window("original")
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(path))])
+        event = QDropEvent(QPointF(5, 5), Qt.DropAction.CopyAction, mime,
+                           Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        w.dropEvent(event)
+        self.assertEqual(w.editor.text(), "dropped content\n")
+        w._mark_clean()      # clears BOTH dirty flags
+        w.close()
+
+    def test_the_window_accepts_drops(self):
+        w = self._window()
+        self.assertTrue(w.acceptDrops())
+        w.close()
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestRecoveryPrompt(unittest.TestCase):
+    """The startup offer: only for work that is genuinely newer than disk."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from raggy import recovery
+        recovery.clear_all()
+        self.addCleanup(recovery.clear_all)
+
+    def _stale_free_snapshot(self, slot="s", text="recovered text"):
+        from raggy import recovery
+        snap = recovery.Snapshot(slot=slot, text=text, path=None)
+        recovery.save(snap)
+        return snap
+
+    def test_nothing_pending_means_no_prompt(self):
+        from raggy.app import MainWindow, _offer_recovery
+        w = MainWindow()
+        w._index_timer.stop()
+        w._save_timer.stop()
+        with mock.patch("raggy.app.QMessageBox.question") as q:
+            _offer_recovery(w)
+        self.assertFalse(q.called)
+        w.close()
+
+    def test_yes_restores_the_most_recent_snapshot(self):
+        from PyQt6.QtWidgets import QMessageBox
+        from raggy.app import MainWindow, _offer_recovery
+        self._stale_free_snapshot(text="recovered text")
+        w = MainWindow()
+        w._index_timer.stop()
+        w._save_timer.stop()
+        w.editor.setModified(False)
+        with mock.patch("raggy.app.QMessageBox.question",
+                        return_value=QMessageBox.StandardButton.Yes):
+            _offer_recovery(w)
+        self.assertEqual(w.editor.text(), "recovered text")
+        w._mark_clean()      # clears BOTH dirty flags
+        w.close()
+
+    def test_discard_clears_everything(self):
+        from PyQt6.QtWidgets import QMessageBox
+        from raggy import recovery
+        from raggy.app import MainWindow, _offer_recovery
+        self._stale_free_snapshot(text="recovered text")
+        w = MainWindow()
+        w._index_timer.stop()
+        w._save_timer.stop()
+        w.editor.setModified(False)
+        with mock.patch("raggy.app.QMessageBox.question",
+                        return_value=QMessageBox.StandardButton.Discard):
+            _offer_recovery(w)
+        self.assertEqual(recovery.list_all(), [])
+        w.close()
+
+
+class TestBundleDeclaresDocumentTypes(unittest.TestCase):
+    """A downloadable editor must be able to open a .txt by double-clicking.
+
+    Without CFBundleDocumentTypes macOS does not know the app handles text, so the
+    file simply opens in something else and RaggyEditor is missing from Finder's
+    "Open With". There is no runtime symptom to test, so the spec is inspected.
+    """
+
+    def test_the_spec_declares_plain_text(self):
+        spec = (pathlib.Path(__file__).resolve().parents[1]
+                / "packaging" / "raggyeditor.spec").read_text(encoding="utf-8")
+        self.assertIn("CFBundleDocumentTypes", spec)
+        self.assertIn("public.plain-text", spec)
+        for ext in ("txt", "md", "log"):
+            self.assertIn(ext, spec)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,14 @@ coll = COLLECT(
 )
 
 if sys.platform == "darwin":
+    # ⚠️ Without CFBundleDocumentTypes macOS does not know RaggyEditor can open a
+    # text file. Double-clicking a .txt does nothing, and the app is missing from
+    # Finder's "Open With" — which for a downloadable editor is the difference
+    # between a real Mac app and a program you have to launch first.
+    #
+    # macOS hands an opened document to the app as argv[1]; raggy.app:main already
+    # takes a path there, so this declaration is the whole wiring.
+    _TEXT_EXTENSIONS = ["txt", "text", "md", "markdown", "log", "csv", "tsv", "json"]
     app = BUNDLE(
         coll,
         name="RaggyEditor.app",
@@ -87,9 +95,17 @@ if sys.platform == "darwin":
             "CFBundleDisplayName": "RaggyEditor",
             "CFBundleShortVersionString": "0.1.0",
             "NSHighResolutionCapable": True,
-            # The app downloads its model over the network on request, and opens
-            # local files the user picks — neither needs a special entitlement,
-            # but the reason string is required if a sandbox asks.
             "LSMinimumSystemVersion": "11.0",
+            "CFBundleDocumentTypes": [
+                {
+                    "CFBundleTypeName": "Plain Text Document",
+                    "CFBundleTypeRole": "Editor",
+                    "LSHandlerRank": "Alternate",
+                    "LSItemContentTypes": ["public.plain-text", "public.utf8-plain-text"],
+                    "CFBundleTypeExtensions": _TEXT_EXTENSIONS,
+                },
+            ],
+            # Being able to "Open With" the app is the point of the above.
+            "CFBundleTypeRole": "Editor",
         },
     )

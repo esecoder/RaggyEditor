@@ -77,6 +77,30 @@ and indentation, and gives no way to keep the two in step. `raggy/printing.py`
 computes the layout instead, and takes the width measurement as an argument, so
 the wrapping and paging rules are unit-tested without a window or a printer.
 
+### Your file is not modified behind your back
+
+Opening and saving a document reproduces its **exact format** — encoding, BOM and
+line endings. `File ▸ Line Endings` converts deliberately (LF / CRLF / CR), and
+that conversion counts as an unsaved change.
+
+⚠️ Earlier versions read every file as UTF-8 and wrote it back the same way, so a
+Windows file came back as LF and a Latin-1 file came back as UTF-8, with no
+warning. A file that is not valid UTF-8 is now opened as Latin-1 and the app
+**says so** rather than pretending it understood. See `raggy/textfile.py`; the
+tests assert on **bytes**, because a str-level round trip hides both bugs.
+
+### Autosave and crash recovery
+
+While a document has unsaved changes the app writes a snapshot every few seconds
+to `~/.config/RaggyEditor/recovery/` (mode `0600`, directory `0700` — it holds
+your text in plain form). On the next launch it offers to restore.
+
+⚠️ A snapshot is only offered when it is **newer than the file on disk**. If you
+saved and *then* the app died, restoring would silently roll you backwards — a
+data-loss bug wearing a safety net's clothes, so `recovery.pending()` enforces the
+rule and a test pins it. An **untitled** document is always offered: it exists
+nowhere else.
+
 ### Answers need a model — and the app says so
 
 **Ask a Question About This Document…** (`Cmd+Shift+A`, under the Find menu) opens
@@ -191,7 +215,7 @@ from **Help ▸ Enable Search by Meaning…**.
 ./run.sh install      # .venv with the full app stack (engine + GUI + ONNX)
 ./run.sh app          # launch the editor
 ./run.sh demo         # offline engine tour — no GUI, no model, no key
-./run.sh test         # 159 tests
+./run.sh test         # 226 tests
 ```
 
 ### Just the engine, no Qt
@@ -357,7 +381,7 @@ answer.
 
 ## Verified / not verified
 
-✅ **159 tests pass** (`./run.sh test`), hermetic — no network, no model download,
+✅ **226 tests pass** (`./run.sh test`), hermetic — no network, no model download,
 and the app's settings redirected into a scratch directory via
 `RAGGY_SETTINGS_DIR` so nothing touches your real preferences. ⚠️
 `QSettings.setPath()` is NOT enough on macOS: Qt ignores it and writes to
