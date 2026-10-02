@@ -75,6 +75,24 @@ except Exception:                                                   # noqa: BLE0
 
 APP_NAME = "RaggyEditor"
 
+# =============================================================================
+# BUILD STAMP
+# =============================================================================
+# ⚠️ WHY THIS EXISTS. A stale .app was shipped and run: the chunking fix was
+# committed, the bundle was not rebuilt, and nothing about the running app said
+# so — every symptom looked like "the fix did not work" rather than "the fix is
+# not here". A build that cannot identify itself is not checkable.
+try:                                    # written by scripts/package.sh
+    from raggy._build import STAMP as _BUILT_STAMP
+except Exception:                       # a source checkout, or a dev run
+    _BUILT_STAMP = "source"
+BUILD_STAMP = os.environ.get("RAGGY_BUILD_STAMP") or _BUILT_STAMP
+
+
+def build_info() -> str:
+    """One line naming the code that is actually running."""
+    return f"build {BUILD_STAMP}"
+
 IND_EXACT = 8
 IND_RELATED = 9
 COL_EXACT = 0x40E0FF        # Scintilla colours are BGR: amber
@@ -2505,6 +2523,7 @@ if HAS_QT:
                 "A plain text editor that can find passages by meaning, as well as "
                 "by the exact words you type.<br><br>"
                 f"Answers: {answers}<br>"
+                f"{build_info()}<br>"
                 "Free software under the GNU General Public License v3.<br>"
                 "Editing engine: Scintilla."))
 
@@ -2639,11 +2658,33 @@ def should_reopen_window() -> bool:
     return windows.ever_opened and windows.count() == 0
 
 
+def selftest_chunking() -> bool:
+    """Prove the chunker in THIS build respects the target size.
+
+    ⚠️ Constructing a window proves almost nothing: a bundle built from older
+    code opens a window perfectly well. That is exactly how a stale .app shipped
+    looking healthy, so the packaged self-test checks behaviour that the fix
+    changed — a heading over one huge section, which is the shape that used to
+    produce a single 237,315-character chunk.
+    """
+    from raggy import chunking
+    target = 600
+    document = "# Heading\n\n" + ("A sentence about the system in question. " * 400)
+    chunks = chunking.chunk_text(document, "recursive", target, 80)
+    biggest = max((len(c.text) for c in chunks), default=0)
+    ok = biggest <= target
+    print(f"selftest: chunking max={biggest} (target {target}) -> "
+          f"{'OK' if ok else 'FAIL — this build predates the chunk-size fix'}")
+    return ok
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     selftest = "--selftest" in argv
     if selftest:
         argv = [a for a in argv if a != "--selftest"]
+    if selftest:
+        print(f"selftest: {build_info()}")
     if not HAS_QT:
         print("RaggyEditor needs PyQt6 and QScintilla:\n"
               "    ./run.sh install\n"
@@ -2656,7 +2697,10 @@ def main(argv: list[str] | None = None) -> int:
     if selftest:
         print("selftest: window constructed OK")
         QTimer.singleShot(0, app.quit)
-        return app.exec()
+        code = app.exec()
+        # ⚠️ Non-zero when the ENGINE is wrong, so `scripts/package.sh` fails the
+        # build instead of producing an installer that looks fine.
+        return code if selftest_chunking() else 1
     if not path:
         QTimer.singleShot(0, lambda: _offer_recovery(win))
     return app.exec()
