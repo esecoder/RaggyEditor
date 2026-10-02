@@ -333,6 +333,18 @@ class RaggyEngine:
         used = {int(m) for m in re.findall(r"\[(\d+)\]", answer)}
         return sorted(i - 1 for i in used if 1 <= i <= n_context)
 
+    # -------------------------------------------------------------- renaming
+    def rename(self, doc_name: str) -> None:
+        """Follow a document that was renamed on disk.
+
+        ⚠️ Both names have to move together. `index()` resets the whole vector
+        cache when `doc_name` changes — which is right when a DIFFERENT document
+        arrives, and pure waste when the same bytes simply got a new filename. Set
+        them in one place so a rename does not silently re-encode the document.
+        """
+        self.doc_name = doc_name
+        self._cache_doc = doc_name
+
     # ----------------------------------------------------------------- status
     def status(self) -> dict:
         return {

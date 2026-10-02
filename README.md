@@ -32,12 +32,14 @@ Cmd+F  "how do I fix an expired certificate on a replica"
 | | |
 |---|---|
 | `Cmd+N` / `Cmd+O` / `Cmd+S` / `Cmd+Shift+S` | New window · Open · Save · Save As |
+| `Cmd+Shift+R` | Rename the file on disk |
 | `Cmd+F` | Find (exact **and** meaning) |
 | `Cmd+Alt+F` | Find and Replace |
 | `Cmd+G` / `Cmd+Shift+G` | Find next / previous |
 | `Cmd+E` | Use selection for find |
 | `Cmd+L` | Go to line |
 | `Cmd+J` | Jump to selection |
+| `Cmd+B` / `Cmd+U` | Bold · Underline (see the caveat below) |
 | `Cmd+=` / `Cmd+-` / `Cmd+0` | Zoom in · out · actual size |
 | `Cmd+Shift+P` / `Cmd+P` | Print preview · Print (also File ▸ Export as PDF…) |
 | `Esc` | Close the find bar |
@@ -89,6 +91,80 @@ text content* — it re-wraps at its own width, ignores the editor's wrap settin
 and indentation, and gives no way to keep the two in step. `raggy/printing.py`
 computes the layout instead, and takes the width measurement as an argument, so
 the wrapping and paging rules are unit-tested without a window or a printer.
+
+### Appearance: light, dark, or whatever the system says
+
+**View ▸ Appearance** offers *Match the System*, *Light (white page)* and *Dark*,
+and the choice is remembered. Light is a pure `#ffffff` page — verified by
+sampling the rendered pixels, not by reading a colour constant.
+
+⚠️ The pane and the dialogs are themed from **one** palette (`THEME` in
+`app.py`), because QScintilla ignores the application palette entirely and is
+coloured by hand. Before that, the two drifted apart: a dark pane next to dialogs
+whose secondary text was `palette(mid)` — grey on grey. Two more traps live in
+`_apply_theme` and are commented where they bite:
+
+- QScintilla re-derives its widget **palette** while processing Scintilla
+  messages, so the palette has to be set *last*, or the editor keeps a light
+  `Base` inside a dark window: a bright seam around the text.
+- Giving that widget a **style sheet** instead makes Qt re-resolve `palette()`
+  from the sheet and silently discards the colours, so the editor gets a palette
+  and no sheet.
+
+### Bold and underline — and the honest caveat
+
+`Cmd+B` and `Cmd+U` style the selection, and they combine. **A `.txt` file has
+nowhere to record which characters are bold**, so this is on-screen emphasis: it
+is not saved, and it does not survive reopening the document or printing it. That
+is a property of the plain-text format, not a bug — TextEdit only persists
+formatting because it can save Rich Text. Making it stick means saving as
+RTF/HTML, which is a different feature; it is not implemented.
+
+⚠️ The styles are numbers 40-42. Scintilla reserves 0-39 (`STYLE_DEFAULT` is 32,
+line numbers 33), and a collision there shows up as unexplained underlining
+somewhere else in the document. `STYLECLEARALL` is also skipped once the document
+carries styles, because it resets every character to the default and would wipe
+them on a theme change.
+
+### Formulas are recognised, not typeset
+
+Paste `E = mc^2`, `2H2 + O2 -> 2H2O`, `$\alpha + \beta$` or `\sqrt{x+1}` and the
+notation under the caret is rendered in a strip below the editor — superscripts,
+subscripts, Greek letters, operators, arrows and chemical formulae. **View ▸
+Show Formula Preview** turns it off.
+
+⚠️ **This is not a LaTeX engine.** A real one means matplotlib's mathtext (~40 MB,
+deliberately excluded from the bundle), KaTeX or MathJax (QtWebEngine, larger
+still). `raggy/formulas.py` is a recogniser and a presentational converter with no
+dependencies at all, and it passes anything it does not understand through
+**unchanged** rather than guessing.
+
+The design rule is **under-match**. A missed formula is a cosmetic loss; a
+sentence rewritten into symbols is a corrupted document. So `pi` becomes π only
+inside recognised notation, `render()` defaults to a kind that changes nothing,
+and `"The answer = what you get when you add them all up"` is deliberately not
+a formula. Two regression tests in `tests/test_formulas.py` exist purely because
+loose patterns swallowed the line *above* a formula (via `\s` matching a newline)
+and merged two formulas in one paragraph.
+
+**The text is never modified.** Detection returns character offsets; rendering
+happens in the strip. The file keeps exactly what you typed.
+
+### Renaming the document
+
+`Cmd+Shift+R` renames the file on disk and everything follows it: the window
+title, the recent-files list and the recovery slot. It takes a **name**, not a
+path — a folder separator is refused rather than quietly turning "Rename" into
+"move the file somewhere else". An untitled document falls back to Save As.
+
+⚠️ **What this is not.** TextEdit lets you rename from the document chip in its
+title bar. Qt gives a macOS window a document **proxy icon** (that is
+`setWindowFilePath`, applied in `_update_title`) whose click popup macOS builds
+itself — and Qt does not expose it, so a "Rename" entry cannot be added to it.
+Making the title text itself an editable field would mean a frameless window with
+a hand-built title bar, which would cost the native window chrome. So the command
+lives in the File menu, and the proxy icon is what signals that the title is about
+this file.
 
 ### Your file is not modified behind your back
 
@@ -228,7 +304,7 @@ from **Help ▸ Enable Search by Meaning…**.
 ./run.sh install      # .venv with the full app stack (engine + GUI + ONNX)
 ./run.sh app          # launch the editor
 ./run.sh demo         # offline engine tour — no GUI, no model, no key
-./run.sh test         # 252 tests
+./run.sh test         # 317 tests
 ```
 
 ### Just the engine, no Qt
@@ -394,7 +470,7 @@ answer.
 
 ## Verified / not verified
 
-✅ **252 tests pass** (`./run.sh test`), hermetic — no network, no model download,
+✅ **317 tests pass** (`./run.sh test`), hermetic — no network, no model download,
 and the app's settings redirected into a scratch directory via
 `RAGGY_SETTINGS_DIR` so nothing touches your real preferences. ⚠️
 `QSettings.setPath()` is NOT enough on macOS: Qt ignores it and writes to

@@ -55,13 +55,15 @@ import uuid
 from raggy import model_store, recovery, textfile
 from raggy.aiconfig import PROVIDERS, AIConfig
 from raggy.engine import RaggyEngine
+from raggy import formulas
 from raggy.offsets import OffsetMap
 from raggy.printing import footer_text, paginate, rows_for_document, rows_per_page
 
 try:
     from PyQt6 import Qsci
     from PyQt6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QAction, QColor, QKeySequence, QPageSize, QPalette
+    from PyQt6.QtGui import (QAction, QColor, QKeySequence, QPageSize, QPalette,
+                             QShortcut)
     from PyQt6.QtWidgets import (
         QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
         QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow,
@@ -79,9 +81,135 @@ COL_EXACT = 0x40E0FF        # Scintilla colours are BGR: amber
 COL_RELATED = 0xFFBE8C      # blue
 MAX_EXACT = 2000
 UNTITLED = "Untitled"
+
+# =============================================================================
+# BOLD AND UNDERLINE
+# =============================================================================
+# ⚠️ STYLE NUMBERS 40+ ARE OURS. Scintilla reserves 0-39: STYLE_DEFAULT is 32,
+# line numbers 33, brace highlighting 34-35, and so on (STYLE_LASTPREDEFINED is
+# 39). Anything below 40 risks a collision with a built-in that would show up as
+# random underlining somewhere else in the document.
+STYLE_BOLD = 40
+STYLE_UNDERLINE = 41
+STYLE_BOLD_UNDERLINE = 42
+#: Style number -> (bold, underline). Anything absent is plain.
+STYLE_FLAGS = {
+    STYLE_BOLD: (True, False),
+    STYLE_UNDERLINE: (False, True),
+    STYLE_BOLD_UNDERLINE: (True, True),
+}
+#: The mask SCI_STARTSTYLING uses to say "these are the style bits to change".
+STYLE_BITS = 0x1F
 MAX_RECENT = 10
 
 FIND_PLACEHOLDER = "Find — words, or describe what you mean"
+
+# =============================================================================
+# THE TWO PALETTES
+# =============================================================================
+# ⚠️ ONE SOURCE OF TRUTH. The editor pane is themed by hand (QScintilla ignores
+# the application palette entirely — see MainWindow._apply_theme), so before this
+# existed the pane and the dialogs were coloured by two different mechanisms and
+# drifted apart: dark editor, and dialogs whose muted labels were `palette(mid)`
+# grey-on-grey. Everything visual now reads from THEME.
+THEME = {
+    False: {                                   # light
+        "paper": "#ffffff", "ink": "#000000", "caret": "#000000",
+        "sel_bg": "#b3d7ff", "sel_fg": "#000000",
+        "window": "#ececec", "muted": "#6f6f6f", "border": "#c9c9c9",
+        "button": "#f6f6f6", "button_border": "#c9c9c9",
+        "exact": COL_EXACT, "related": COL_RELATED,
+    },
+    True: {                                    # dark
+        "paper": "#1e1e1e", "ink": "#e8e8e8", "caret": "#ffffff",
+        "sel_bg": "#2f5fa8", "sel_fg": "#ffffff",
+        "window": "#252526", "muted": "#9d9d9d", "border": "#3c3c3c",
+        "button": "#3a3a3c", "button_border": "#4a4a4c",
+        "exact": 0x66D1FF, "related": 0xFFA96A,
+    },
+}
+
+#: Qt style sheets cannot express palette roles, so the few things the palette
+#: does not cover (muted label text, and the field/button chrome Qt draws in its
+#: own light style) are set here. Kept minimal on purpose: a heavy sheet stops
+#: looking native.
+DIALOG_QSS = {
+    False: 'QLabel[role="muted"] { color: %(muted)s; font-size: 12px; }'
+           'QLabel[role="ok"] { color: #1a7f37; }'
+           'QLabel[role="bad"] { color: #b3261e; }',
+    True: 'QLabel[role="muted"] { color: %(muted)s; font-size: 12px; }'
+          'QLabel[role="ok"] { color: #5dd07a; }'
+          'QLabel[role="bad"] { color: #ff8a80; }'
+          'QLineEdit, QPlainTextEdit, QComboBox {'
+          ' background: %(paper)s; color: %(ink)s;'
+          ' border: 1px solid %(border)s; border-radius: 4px; padding: 4px; }'
+          'QPushButton { background: %(button)s; color: %(ink)s;'
+          ' border: 1px solid %(button_border)s; border-radius: 6px;'
+          ' padding: 5px 14px; }'
+          'QPushButton:hover { background: #454547; }'
+          'QPushButton:disabled { color: #8a8a8a; }',
+}
+
+
+def theme(dark) -> dict:
+    """The colour set for a mode. The single lookup everything else uses."""
+    return THEME[bool(dark)]
+
+
+def system_is_dark(widget=None) -> bool:
+    """Is the platform in dark mode?
+
+    Qt 6.5+ reports the scheme directly. `Unknown` means the platform has no
+    opinion (headless, or a theme that does not say), so fall back to the palette
+    the application was given.
+    """
+    try:
+        scheme = QApplication.styleHints().colorScheme()
+        if scheme == Qt.ColorScheme.Dark:
+            return True
+        if scheme == Qt.ColorScheme.Light:
+            return False
+    except Exception:                                           # noqa: BLE001
+        pass
+    source = widget.palette() if widget is not None else QApplication.palette()
+    return source.color(QPalette.ColorRole.Window).lightness() < 128
+
+
+def apply_theme_to(widget, dark=None) -> bool:
+    """Give a widget (dialog, frame, label container) the app's colours.
+
+    Returns the mode applied, so callers can remember what they used.
+    """
+    dark = system_is_dark(widget) if dark is None else bool(dark)
+    widget.setPalette(_palette_for(dark))
+    widget.setStyleSheet(DIALOG_QSS[dark] % theme(dark))
+    return dark
+
+
+def _palette_for(dark) -> "QPalette":
+    """A QPalette for a mode. `apply_theme_to` also sets a style sheet; this is
+    the palette half on its own, for widgets that must not take a sheet."""
+    c = theme(dark)
+    roles = QPalette.ColorRole
+    pal = QPalette()
+    for role, value in (
+            (roles.Window, c["window"]), (roles.Base, c["paper"]),
+            (roles.AlternateBase, c["window"]), (roles.Text, c["ink"]),
+            (roles.WindowText, c["ink"]), (roles.ButtonText, c["ink"]),
+            (roles.Button, c["button"]), (roles.ToolTipBase, c["paper"]),
+            (roles.ToolTipText, c["ink"]), (roles.Highlight, c["sel_bg"]),
+            (roles.HighlightedText, c["sel_fg"])):
+        try:
+            pal.setColor(role, QColor(value))
+        except Exception:                                       # noqa: BLE001
+            pass
+    return pal
+
+
+def mark_muted(label):
+    """Tag a label as secondary text, themed by DIALOG_QSS."""
+    label.setProperty("role", "muted")
+    return label
 REPLACE_PLACEHOLDER = "Replace with…"
 
 
@@ -220,7 +348,7 @@ if HAS_QT:
 
             self.key_note = QLabel("")
             self.key_note.setWordWrap(True)
-            self.key_note.setStyleSheet("color: palette(mid); font-size: 12px;")
+            mark_muted(self.key_note)
             outer.addWidget(self.key_note)
 
             row = QHBoxLayout()
@@ -245,6 +373,7 @@ if HAS_QT:
             # `QDialog.result()` is a real method that exec()/accept() rely on;
             # assigning an attribute called `result` silently replaces it and the
             # dialog's return value stops working.
+            self.apply_theme()
             self._prefill_empty_fields()
             self._update_note()
 
@@ -290,13 +419,25 @@ if HAS_QT:
                     "This address is on this computer, so no key is needed and "
                     "nothing leaves the machine.")
 
+        def apply_theme(self, dark=None) -> bool:
+            return apply_theme_to(self, dark)
+
+        def _set_result(self, text: str, ok=None):
+            """⚠️ `role` is what colours the text; Qt only re-reads it after a
+            repolish, so the style has to be nudged or the colour never changes."""
+            self.result_label.setText(text)
+            self.result_label.setProperty("role", "" if ok is None else ("ok" if ok else "bad"))
+            style = self.result_label.style()
+            style.unpolish(self.result_label)
+            style.polish(self.result_label)
+
         def _test_connection(self):
             cfg = self._current()
             if not cfg.base_url or not cfg.model:
-                self.result_label.setText("Fill in the address and the model first.")
+                self._set_result("Fill in the address and the model first.", ok=False)
                 return
             self.test_btn.setEnabled(False)
-            self.result_label.setText("Trying…")
+            self._set_result("Trying…")
             self._test = TestAIConnection(cfg.build_client())
             self._test.done.connect(lambda r: self._tested(f"Working. The model said: “{r}”"))
             self._test.failed.connect(lambda m: self._tested(f"Failed: {m}"))
@@ -304,15 +445,15 @@ if HAS_QT:
 
         def _tested(self, message: str):
             self.test_btn.setEnabled(True)
-            self.result_label.setText(message)
+            self._set_result(message, ok=message.startswith("Working"))
 
         def _save(self):
             cfg = self._current()
             if not cfg.base_url or not cfg.model:
-                self.result_label.setText("An address and a model are required.")
+                self._set_result("An address and a model are required.", ok=False)
                 return
             if cfg.needs_key and not cfg.api_key:
-                self.result_label.setText("An API key is required for this provider.")
+                self._set_result("An API key is required for this provider.", ok=False)
                 return
             cfg.save()
             self.saved.emit()
@@ -336,6 +477,8 @@ if HAS_QT:
             self.setWindowTitle("Ask About This Document")
             self.setMinimumSize(680, 480)
             self.resize(760, 560)
+            self._configured = False
+            self._ai_description = ""
 
             lay = QVBoxLayout(self)
             lay.setSpacing(8)
@@ -364,9 +507,16 @@ if HAS_QT:
             self.setup_btn.clicked.connect(self.setupRequested)
             self.setup_btn.hide()
             bottom.addWidget(self.setup_btn)
+
+            # An answer is the one thing here worth taking elsewhere.
+            self.copy_btn = QPushButton("Copy Answer")
+            self.copy_btn.clicked.connect(self.copy_answer)
+            self.copy_btn.hide()
+            bottom.addWidget(self.copy_btn)
+
             bottom.addStretch(1)
             self.status = QLabel("")
-            self.status.setStyleSheet("color: palette(mid); font-size: 12px;")
+            mark_muted(self.status)
             bottom.addWidget(self.status)
             lay.addLayout(bottom)
 
@@ -374,15 +524,32 @@ if HAS_QT:
             buttons.rejected.connect(self.reject)
             lay.addWidget(buttons)
 
+            # Cmd+Enter asks too: the field already answers to Enter, but with the
+            # caret in the answer area that is not obvious.
+            shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+            shortcut.activated.connect(self._emit)
+            self.apply_theme()
+
+        # ------------------------------------------------------------ theming
+        def apply_theme(self, dark=None) -> bool:
+            return apply_theme_to(self, dark)
+
+        def copy_answer(self):
+            QApplication.clipboard().setText(self.answer.toPlainText())
+            self.status.setText("Copied.")
+
         def _emit(self):
             q = self.question.text().strip()
             if q:
                 self.asked.emit(q)
 
         def set_ai_configured(self, configured: bool, description: str = ""):
+            self._configured = bool(configured)
             self.setup_btn.setVisible(not configured)
-            self.status.setText("" if configured else
-                                "No model connected — answers are limited to passages.")
+            self.status.setText(f"Answers by {description}" if configured
+                                else "No model connected — answers are limited "
+                                     "to the passages themselves.")
+            self._ai_description = description or ""
             self.setWindowTitle("Ask About This Document"
                                 + ("" if configured else " — not set up"))
 
@@ -399,6 +566,9 @@ if HAS_QT:
         def show_answer(self, text: str):
             self.set_busy(False)
             self.answer.setPlainText(text)
+            self.copy_btn.setVisible(bool((text or "").strip()))
+            if self._configured:
+                self.status.setText("Answers by " + self._ai_description)
 
     # =========================================================================
     # FIND BAR
@@ -427,9 +597,10 @@ if HAS_QT:
         def __init__(self):
             super().__init__()
             self.setFrameShape(QFrame.Shape.NoFrame)
-            self.setStyleSheet(
-                "FindBar { background: palette(window);"
-                " border-bottom: 1px solid palette(mid); }")
+            # ⚠️ `palette(window)` looked fine in light mode and gave dark grey on
+            # dark grey in dark mode. The bar is now themed from THEME with
+            # everything else; see apply_theme below.
+            self.apply_theme()
 
             outer = QVBoxLayout(self)
             outer.setContentsMargins(10, 6, 10, 6)
@@ -447,7 +618,7 @@ if HAS_QT:
             row.addWidget(self.field, 1)
 
             self.status = QLabel("")
-            self.status.setStyleSheet("color: palette(mid); font-size: 12px;")
+            mark_muted(self.status)
             row.addWidget(self.status)
 
             self.case_btn = self._toggle("Aa", "Match case")
@@ -547,6 +718,21 @@ if HAS_QT:
         def replacement(self) -> str:
             return self.replace_field.text()
 
+        def apply_theme(self, dark=None) -> bool:
+            """Match the bar to the editor pane.
+
+            ⚠️ The bar sits directly above the document, so any difference in tone
+            is the first thing the eye sees. It reads from THEME like the pane.
+            """
+            dark = system_is_dark(self) if dark is None else bool(dark)
+            c = theme(dark)
+            self.setPalette(_palette_for(dark))
+            self.setStyleSheet(
+                "FindBar { background: %(window)s;"
+                " border-bottom: 1px solid %(border)s; }" % c
+                + DIALOG_QSS[dark] % c)
+            return dark
+
         def set_status(self, text: str):
             self.status.setText(text)
 
@@ -633,6 +819,66 @@ if HAS_QT:
                 win._mark_clean()
                 win.close()
 
+    class FormulaBar(QFrame):
+        """A transient strip that renders the notation under the caret.
+
+        ⚠️ TRANSIENT, like the find bar — it is hidden unless there is a formula
+        to show, so the window still looks like one plain editor pane. This is why
+        rendering lives here rather than in a permanent side panel, or in the text
+        itself: the document is never modified by looking at it.
+        """
+
+        def __init__(self):
+            super().__init__()
+            self.setFrameShape(QFrame.Shape.NoFrame)
+
+            outer = QHBoxLayout(self)
+            outer.setContentsMargins(10, 4, 8, 4)
+            outer.setSpacing(10)
+
+            caption = QLabel("Formula")
+            mark_muted(caption)
+            outer.addWidget(caption, 0, Qt.AlignmentFlag.AlignTop)
+
+            self.render = QLabel("")
+            self.render.setTextFormat(Qt.TextFormat.RichText)
+            self.render.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.render.setWordWrap(True)
+            outer.addWidget(self.render, 1)
+
+            self.kind = QLabel("")
+            mark_muted(self.kind)
+            outer.addWidget(self.kind, 0, Qt.AlignmentFlag.AlignTop)
+
+            self.apply_theme()
+
+        def apply_theme(self, dark=None) -> bool:
+            dark = system_is_dark(self) if dark is None else bool(dark)
+            c = theme(dark)
+            self.setPalette(_palette_for(dark))
+            self.setStyleSheet(
+                "FormulaBar { background: %(window)s;"
+                " border-top: 1px solid %(border)s; }" % c
+                + DIALOG_QSS[dark] % c)
+            return dark
+
+        def show_formula(self, formula, dark: bool):
+            """Render one formula, or fall back to the raw text if it cannot be."""
+            try:
+                markup = formulas.render_formula(formula, dark=dark)
+            except Exception:                                       # noqa: BLE001
+                # ⚠️ A preview that crashes on odd input is worse than a plain
+                # one: fall back to the text the user actually typed.
+                markup = None
+            if markup:
+                self.render.setText(markup)
+            else:
+                self.render.setText(
+                    f'<span style="font-family:monospace">{formula.text}</span>')
+            self.kind.setText(formula.kind)
+            self.show()
+
     class MainWindow(QMainWindow):
 
         def __init__(self, path: str | None = None, cascade: int = 0):
@@ -665,6 +911,10 @@ if HAS_QT:
             # snapshot — needs to be recorded here, or the app will happily close
             # without saving it.
             self._extra_dirty = False
+            #: True once any character carries one of our bold/underline styles.
+            #: ⚠️ Guards STYLECLEARALL, which would otherwise wipe them on a theme
+            #: change. Reset whenever the text is replaced wholesale.
+            self._styled = False
             self._untitled_key = uuid.uuid4().hex[:8]
 
             self._index_timer = QTimer(self)
@@ -728,16 +978,29 @@ if HAS_QT:
             self.find_bar.replaceRequested.connect(self._do_replace)
             self.find_bar.set_replace_enabled(False, "Search for something first")
 
+            # ⚠️ BELOW the editor, not above it. A strip that appears above the
+            # text pushes every line down as the caret moves between formulas; this
+            # way the text stays exactly where it is and only the visible height
+            # changes.
+            self.formula_bar = FormulaBar()
+            self.formula_bar.hide()
+
             central = QWidget()
             col = QVBoxLayout(central)
             col.setContentsMargins(0, 0, 0, 0)
             col.setSpacing(0)
             col.addWidget(self.find_bar)
             col.addWidget(self.editor, 1)
+            col.addWidget(self.formula_bar)
             self.setCentralWidget(central)
             self.setAcceptDrops(True)        # drop a file on the window to open it
 
             self.editor.textChanged.connect(self._on_text_changed)
+            self.editor.textChanged.connect(self._update_formula_preview)
+            # The Bold/Underline ticks follow the caret, so the menu shows the
+            # style under it rather than being write-only.
+            self.editor.cursorPositionChanged.connect(self._update_style_menu)
+            self.editor.cursorPositionChanged.connect(self._update_formula_preview)
             try:
                 self.editor.modificationChanged.connect(self.setWindowModified)
             except Exception:                                       # noqa: BLE001
@@ -754,6 +1017,9 @@ if HAS_QT:
             f.addSeparator()
             self._act(f, "&Save", QKeySequence.StandardKey.Save, self.save_file)
             self._act(f, "Save &As…", QKeySequence.StandardKey.SaveAs, self.save_as)
+            # ⚠️ Cmd+Shift+R rather than a bare Cmd+R: that is reload/revert in too
+            # many apps to take away.
+            self._act(f, "&Rename…", "Ctrl+Shift+R", self.rename_document)
             self._act(f, "Re&vert to Saved", None, self.revert_to_saved)
             f.addSeparator()
             self._act(f, "&Export as PDF…", None, self.export_pdf)
@@ -783,6 +1049,16 @@ if HAS_QT:
             e.addSeparator()
             self._act(e, "Select &All", QKeySequence.StandardKey.SelectAll,
                       self.editor.selectAll)
+            e.addSeparator()
+            # ⚠️ Both are checkable and reflect the style under the caret, so the
+            # menu says what the selection currently is instead of being write-only.
+            self._bold_action = self._act(e, "&Bold", QKeySequence.StandardKey.Bold,
+                                          self.toggle_bold)
+            self._bold_action.setCheckable(True)
+            self._underline_action = self._act(e, "&Underline",
+                                               QKeySequence.StandardKey.Underline,
+                                               self.toggle_underline)
+            self._underline_action.setCheckable(True)
             t = e.addMenu("&Transformations")
             self._act(t, "Make &Upper Case", "Ctrl+Shift+U",
                       lambda: self.transform_case("upper"))
@@ -807,6 +1083,30 @@ if HAS_QT:
             self._act(v, "Zoom &In", "Ctrl+=", self.zoom_in)
             self._act(v, "Zoom &Out", "Ctrl+-", self.zoom_out)
             self._act(v, "&Actual Size", "Ctrl+0", self.zoom_reset)
+            v.addSeparator()
+            # ⚠️ Appearance is a SETTING, not a system read-out: the pane is themed
+            # by hand, so nothing stops us honouring "I want a white page on a dark
+            # desktop" — which is exactly what TextEdit's light look is.
+            v.addSeparator()
+            self._formula_action = self._act(
+                v, "Show &Formula Preview", None,
+                lambda: self.set_formula_preview(not self.formula_preview_enabled()))
+            self._formula_action.setCheckable(True)
+            self._formula_action.setChecked(self.formula_preview_enabled())
+
+            appearance = v.addMenu("&Appearance")
+            appearance.setToolTipsVisible(True)
+            self._appearance_actions = {}
+            for key, label in (("system", "Match the &System"),
+                               ("light", "&Light (white page)"),
+                               ("dark", "&Dark")):
+                action = QAction(label, self)
+                action.setCheckable(True)
+                action.setChecked(False)
+                action.triggered.connect(lambda _=False, k=key: self.set_appearance(k))
+                appearance.addAction(action)
+                self._appearance_actions[key] = action
+            self._update_appearance_menu()
 
             fmt = m.addMenu("F&ormat")
             self._font_action = self._act(fmt, "&Font…", None, self.choose_font)
@@ -845,39 +1145,48 @@ if HAS_QT:
 
         # ------------------------------------------------------------- theming
         def _is_dark(self) -> bool:
-            """Qt 6.5+ reports the scheme directly; Unknown means ask the palette."""
-            try:
-                scheme = QApplication.styleHints().colorScheme()
-                if scheme == Qt.ColorScheme.Dark:
-                    return True
-                if scheme == Qt.ColorScheme.Light:
-                    return False
-            except Exception:                                       # noqa: BLE001
-                pass
-            window = self.palette().color(QPalette.ColorRole.Window)
-            return window.lightness() < 128
+            """The appearance in force.
+
+            ⚠️ The `appearance` setting wins over the platform. QScintilla is
+            themed by hand, so "follow the system" is only a default — and a user
+            who wants a white page on a dark desktop (TextEdit's light look) has
+            no other way to ask for it.
+            """
+            choice = str(self._settings.value("appearance", "system") or "system")
+            if choice == "light":
+                return False
+            if choice == "dark":
+                return True
+            return system_is_dark(self)
+
+        def set_appearance(self, choice: str):
+            self._settings.setValue("appearance", choice)
+            self._apply_theme()
+            self._update_appearance_menu()
+
+        def _update_appearance_menu(self):
+            current = str(self._settings.value("appearance", "system") or "system")
+            for name, action in getattr(self, "_appearance_actions", {}).items():
+                action.setChecked(name == current)
 
         def _apply_theme(self):
-            """Colour the editor to match the platform, including the caret.
+            """Colour the pane, the find bar and every open dialog alike.
 
             ⚠️ QScintilla does NOT follow the application palette: it keeps a
             white background and a BLACK CARET whatever the system theme is. In
             dark mode that leaves a black caret on a white pane, and a white pane
             inside dark window chrome. Every colour below has to be set by hand.
+
+            ⚠️ The editor's Qt palette is set too, not just Scintilla's styles.
+            Scintilla paints the text area itself, but the widget around it is
+            drawn by Qt from the palette — which stayed WHITE in dark mode, so any
+            area Qt got to paint was a bright seam in a dark window.
             """
             dark = self._is_dark()
-            if dark:
-                paper = QColor("#1e1e1e")
-                ink = QColor("#e8e8e8")
-                caret = QColor("#ffffff")   # ⚠️ bright: a dark caret is invisible
-                sel_bg, sel_fg = QColor("#2f5fa8"), QColor("#ffffff")
-                exact, related = 0x66D1FF, 0xFFA96A
-            else:
-                paper = QColor("#ffffff")
-                ink = QColor("#000000")
-                caret = QColor("#000000")
-                sel_bg, sel_fg = QColor("#b3d7ff"), QColor("#000000")
-                exact, related = COL_EXACT, COL_RELATED
+            c = theme(dark)
+            paper, ink = QColor(c["paper"]), QColor(c["ink"])
+            caret = QColor(c["caret"])
+            sel_bg, sel_fg = QColor(c["sel_bg"]), QColor(c["sel_fg"])
 
             e = self.editor
             for setter, value in (
@@ -897,12 +1206,38 @@ if HAS_QT:
             try:
                 e.SendScintilla(S.SCI_STYLESETFORE, S.STYLE_DEFAULT, _bgr(ink))
                 e.SendScintilla(S.SCI_STYLESETBACK, S.STYLE_DEFAULT, _bgr(paper))
-                e.SendScintilla(S.SCI_STYLECLEARALL)
+                # ⚠️ STYLECLEARALL resets EVERY character to STYLE_DEFAULT, which
+                # silently wipes bold and underline. It is only needed to propagate
+                # new colours to styles nothing is using; once the document carries
+                # our styles, skip it and let _define_character_styles recolour them.
+                if not self._styled:
+                    e.SendScintilla(S.SCI_STYLECLEARALL)
                 e.SendScintilla(S.SCI_SETCARETFORE, _bgr(caret))
             except Exception:                                       # noqa: BLE001
                 pass
 
-            for ind, colour in ((IND_EXACT, exact), (IND_RELATED, related)):
+            # The pane is the page: make the container behind it match, so there
+            # is no strip of window grey above, below or beside the text.
+            central = self.centralWidget()
+            if central is not None:
+                central.setAutoFillBackground(True)
+                central.setPalette(_palette_for(dark))
+
+            self.find_bar.apply_theme(dark)
+            self.formula_bar.apply_theme(dark)
+            self._update_formula_preview()
+
+            # A dialog already on screen should change with the system, not keep
+            # the colours it was born with.
+            for dialog in (self._ask_dialog,):
+                if dialog is not None:
+                    dialog.apply_theme(dark)
+
+            # Keep the window-manager chrome (title bar) in step on platforms Qt
+            # derives it from the palette.
+            self.setPalette(_palette_for(dark))
+
+            for ind, colour in ((IND_EXACT, c["exact"]), (IND_RELATED, c["related"])):
                 try:
                     e.SendScintilla(S.SCI_INDICSETSTYLE, ind, S.INDIC_ROUNDBOX)
                     e.SendScintilla(S.SCI_INDICSETFORE, ind, colour)
@@ -913,6 +1248,180 @@ if HAS_QT:
                     pass
 
             self._highlight()
+
+            # ⚠️ A PALETTE ONLY — never a style sheet here. Setting a style sheet
+            # makes Qt re-resolve `palette()` from the sheet, which silently throws
+            # away the colours just set and leaves the editor's Base/Window LIGHT in
+            # dark mode: a bright seam in a dark window. This covers what Qt paints
+            # around the text (scrollbar corners, the widget background); Scintilla
+            # paints the text area itself from `paper`.
+            #
+            # ⚠️ And it is set LAST: QScintilla re-derives its palette while
+            # processing Scintilla messages, so the style and highlight calls above
+            # would otherwise discard it.
+            try:
+                e.setPalette(_palette_for(dark))
+            except Exception:                                       # noqa: BLE001
+                pass
+
+            self._define_character_styles()
+
+        # ------------------------------------------------------- formulas
+        def _caret_char_offset(self) -> int:
+            """Where the caret is, in CHARACTERS.
+
+            ⚠️ Only the caller cares, but this is exactly the boundary that bit us
+            before: Scintilla speaks UTF-8 BYTES (`setUtf8(True)`) and
+            `raggy.formulas` speaks character offsets, like `str` indexing. Mixing
+            them styles or previews the wrong text.
+            """
+            e = self.editor
+            try:
+                byte = int(e.SendScintilla(Qsci.QsciScintilla.SCI_GETCURRENTPOS))
+            except Exception:                                       # noqa: BLE001
+                return 0
+            text = e.text()
+            offsets = self._offsets
+            if offsets is None or offsets.text != text:
+                offsets = OffsetMap(text)
+                self._offsets = offsets
+            return offsets.to_char(byte)
+
+        def formula_preview_enabled(self) -> bool:
+            return bool(self._settings.value("formula_preview", True, type=bool))
+
+        def set_formula_preview(self, enabled: bool):
+            self._settings.setValue("formula_preview", bool(enabled))
+            action = getattr(self, "_formula_action", None)
+            if action is not None:
+                action.setChecked(bool(enabled))
+            self._update_formula_preview()
+
+        def _update_formula_preview(self):
+            """Show the notation under the caret, or get out of the way."""
+            try:
+                if not self.formula_preview_enabled():
+                    self.formula_bar.hide()
+                    return
+                text = self.editor.text()
+                if not text:
+                    self.formula_bar.hide()
+                    return
+                found = formulas.formula_at(text, self._caret_char_offset())
+            except Exception:                                       # noqa: BLE001
+                found = None
+            if found is None:
+                self.formula_bar.hide()
+                return
+            self.formula_bar.apply_theme(self._is_dark())
+            self.formula_bar.show_formula(found, dark=self._is_dark())
+
+        def insert_formula_placeholder(self):                       # pragma: no cover
+            """Not implemented: see the README on what this deliberately is not."""
+            raise NotImplementedError
+
+        # ------------------------------------------------- bold and underline
+        def _define_character_styles(self):
+            """(Re)define our bold/underline styles for the current theme + font.
+
+            ⚠️ Scintilla stores a style NUMBER per character, so recolouring is a
+            matter of redefining the style, not of walking the text. The numbers in
+            the document stay valid across a theme or font change.
+            """
+            e = self.editor
+            S = Qsci.QsciScintilla
+            c = theme(self._is_dark())
+            fore, back = _bgr(QColor(c["ink"])), _bgr(QColor(c["paper"]))
+            family = self.editor.font().family().encode("utf-8")
+            for style, (bold, under) in STYLE_FLAGS.items():
+                try:
+                    e.SendScintilla(S.SCI_STYLESETFORE, style, fore)
+                    e.SendScintilla(S.SCI_STYLESETBACK, style, back)
+                    e.SendScintilla(S.SCI_STYLESETFONT, style, family)
+                    e.SendScintilla(S.SCI_STYLESETBOLD, style, int(bold))
+                    e.SendScintilla(S.SCI_STYLESETUNDERLINE, style, int(under))
+                except Exception:                                   # noqa: BLE001
+                    pass
+
+        def _selected_bytes(self) -> tuple[int, int]:
+            """The selection as Scintilla byte positions.
+
+            ⚠️ Byte positions, not characters. Both ends come from Scintilla and go
+            straight back to it, so no conversion is needed here — but mixing this
+            with a Python character offset would style the wrong text.
+            """
+            S = Qsci.QsciScintilla
+            try:
+                return (int(self.editor.SendScintilla(S.SCI_GETSELECTIONSTART)),
+                        int(self.editor.SendScintilla(S.SCI_GETSELECTIONEND)))
+            except Exception:                                       # noqa: BLE001
+                return (0, 0)
+
+        def _style_at(self, pos: int) -> int:
+            try:
+                return int(self.editor.SendScintilla(
+                    Qsci.QsciScintilla.SCI_GETSTYLEAT, pos))
+            except Exception:                                       # noqa: BLE001
+                return Qsci.QsciScintilla.STYLE_DEFAULT
+
+        def toggle_bold(self):
+            self._toggle_character_style("bold")
+
+        def toggle_underline(self):
+            self._toggle_character_style("underline")
+
+        def _toggle_character_style(self, which: str):
+            """Bold or underline the selection, or take it off.
+
+            ⚠️ THIS IS DISPLAY ONLY. A .txt file has nowhere to record which
+            characters are bold, so saving and reopening the document loses it.
+            That is a property of the format, not a bug to be fixed here — see the
+            README. Making it survive needs a rich format (RTF/HTML), which is a
+            different feature.
+            """
+            e = self.editor
+            S = Qsci.QsciScintilla
+            start, end = self._selected_bytes()
+            if start >= end:
+                return                     # nothing selected, nothing to style
+
+            bold, under = STYLE_FLAGS.get(self._style_at(start), (False, False))
+            if which == "bold":
+                bold = not bold
+            else:
+                under = not under
+
+            if bold and under:
+                target = STYLE_BOLD_UNDERLINE
+            elif bold:
+                target = STYLE_BOLD
+            elif under:
+                target = STYLE_UNDERLINE
+            else:
+                target = S.STYLE_DEFAULT
+
+            # ⚠️ STYLE_DEFAULT *is* the plain style here: the text starts life in
+            # it, so "no formatting" is a style number, not an absence.
+            try:
+                e.SendScintilla(S.SCI_STARTSTYLING, start, STYLE_BITS)
+                e.SendScintilla(S.SCI_SETSTYLING, end - start, target)
+            except Exception:                                       # noqa: BLE001
+                return
+            # Remember that this document now carries styles, so a later theme
+            # change does not STYLECLEARALL them away.
+            self._styled = True
+            self._update_style_menu()
+            e.setFocus()
+
+        def _update_style_menu(self):
+            """Tick Bold/Underline when the caret sits in styled text."""
+            S = Qsci.QsciScintilla
+            start, _ = self._selected_bytes()
+            bold, under = STYLE_FLAGS.get(self._style_at(start), (False, False))
+            for action, on in ((getattr(self, "_bold_action", None), bold),
+                               (getattr(self, "_underline_action", None), under)):
+                if action is not None:
+                    action.setChecked(bool(on))
 
         # --------------------------------------------------------------- font
         def _base_point_size(self) -> int:
@@ -1064,6 +1573,8 @@ if HAS_QT:
             self._update_line_ending_menu()   # or the menu keeps the previous file's
             self._indexed_text = ""
             self._offsets = None
+            # ⚠️ The text was replaced, so no character carries a style any more.
+            self._styled = False
             self.editor.setModified(False)
             self._mark_clean()
             self._update_title()
@@ -1118,6 +1629,61 @@ if HAS_QT:
             if ok:
                 self._update_title()
             return ok
+
+        def rename_document(self):
+            """Rename the file on disk, and follow it.
+
+            TextEdit offers this from the document chip in its title bar. Qt gives
+            a macOS window a document PROXY ICON (that is `setWindowFilePath`, set
+            in _update_title) whose click popup macOS builds itself and Qt does not
+            let us add to — so the rename lives in the File menu, and the icon is
+            what tells the user the title is about this file.
+            """
+            if not self.path:
+                # Nothing to rename yet: the useful thing is to give it a name.
+                self.save_as()
+                return False
+
+            directory = os.path.dirname(self.path)
+            current = os.path.basename(self.path)
+            new_name, ok = QInputDialog.getText(
+                self, "Rename", "New name:", QLineEdit.EchoMode.Normal, current)
+            new_name = (new_name or "").strip()
+            if not ok or not new_name or new_name == current:
+                return False
+
+            # ⚠️ A name, not a path. Without this, "Rename" quietly becomes "move
+            # somewhere else", and a typo can walk the document out of its folder.
+            if os.sep in new_name or (os.altsep and os.altsep in new_name):
+                QMessageBox.warning(self, APP_NAME,
+                                    "A name cannot contain a folder separator.\n"
+                                    "Use Save As… to put the file somewhere else.")
+                return False
+            if new_name in (".", ".."):
+                QMessageBox.warning(self, APP_NAME, "That is not a usable file name.")
+                return False
+
+            target = os.path.join(directory, new_name)
+            if os.path.exists(target):
+                QMessageBox.warning(self, APP_NAME,
+                                    f"{new_name} already exists in that folder.")
+                return False
+
+            try:
+                os.rename(self.path, target)
+            except OSError as e:
+                QMessageBox.warning(self, APP_NAME, f"Could not rename the file:\n{e}")
+                return False
+
+            # The document is now a different file. Everything that keyed off the
+            # old path has to move with it.
+            self._forget_snapshot()          # the snapshot belongs to the old name
+            self.path = target
+            self.engine.rename(os.path.basename(target))
+            self._update_title()
+            self._remember_recent(target)
+            self._forget_snapshot()          # recent-list bookkeeping may rewrite it
+            return True
 
         # ------------------------------------------------------- doc format
         def set_line_ending(self, newline: str):
@@ -1772,6 +2338,9 @@ if HAS_QT:
 
         def setup_ai(self):
             dlg = AISetupDialog(self.ai, self)
+            # ⚠️ Take the theme from THIS window rather than letting the dialog
+            # re-detect: the two must agree, and detection is not infallible.
+            dlg.apply_theme(self._is_dark())
             dlg.saved.connect(self._ai_saved)
             dlg.exec()
 
@@ -1786,6 +2355,7 @@ if HAS_QT:
         def ask_document(self):
             if self._ask_dialog is None:
                 self._ask_dialog = AskDialog(self)
+                self._ask_dialog.apply_theme(self._is_dark())
                 self._ask_dialog.asked.connect(self._ask)
                 self._ask_dialog.setupRequested.connect(self.setup_ai)
             self._ask_dialog.set_ai_configured(self.ai.configured, self.ai.describe())

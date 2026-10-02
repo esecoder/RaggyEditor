@@ -89,7 +89,8 @@ class TestDesktopApp(unittest.TestCase):
         view = next(a.menu() for a in w.menuBar().actions()
                     if a.text().replace("&", "") == "View")
         labels = [x.text().replace("&", "") for x in view.actions() if x.text()]
-        self.assertEqual(labels, ["Zoom In", "Zoom Out", "Actual Size"])
+        self.assertEqual(labels, ["Zoom In", "Zoom Out", "Actual Size",
+                                  "Show Formula Preview", "Appearance"])
         w.close()
 
     def test_there_is_no_status_bar(self):
@@ -1509,6 +1510,421 @@ class TestPrintPreview(unittest.TestCase):
         w.close()
 
 
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestAppearance(unittest.TestCase):
+    """Light / dark / follow-the-system, and keeping the pane and dialogs in step."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self):
+        from raggy.app import MainWindow
+        w = MainWindow()
+        w._index_timer.stop()
+        w._find_timer.stop()
+        w._save_timer.stop()
+        return w
+
+    def test_choosing_light_gives_a_white_page(self):
+        # ⚠️ THE point of the setting: a white page on a dark desktop, which is
+        # what TextEdit's light look is. Nothing about it depends on the platform.
+        w = self._window()
+        w.set_appearance("light")
+        self.assertFalse(w._is_dark())
+        self.assertEqual(w.editor.paper().name(), "#ffffff")
+        w._mark_clean()
+        w.close()
+
+    def test_choosing_dark_gives_a_dark_page(self):
+        w = self._window()
+        w.set_appearance("dark")
+        self.assertTrue(w._is_dark())
+        self.assertEqual(w.editor.paper().name(), "#1e1e1e")
+        self.assertEqual(w.editor.color().name(), "#e8e8e8")
+        w._mark_clean()
+        w.close()
+
+    def test_a_dark_pane_has_no_light_seams(self):
+        # ⚠️ QScintilla's widget palette is NOT its paper: it stayed light in dark
+        # mode, so anything Qt painted around the text was a bright seam.
+        from PyQt6.QtGui import QPalette
+        w = self._window()
+        w.set_appearance("dark")
+        pal = w.editor.palette()
+        self.assertEqual(pal.color(QPalette.ColorRole.Base).name(), "#1e1e1e")
+        self.assertEqual(pal.color(QPalette.ColorRole.Window).name(), "#252526")
+        self.assertEqual(
+            w.centralWidget().palette().color(QPalette.ColorRole.Window).name(),
+            "#252526")
+        w._mark_clean()
+        w.close()
+
+    def test_the_choice_is_remembered(self):
+        w = self._window()
+        w.set_appearance("dark")
+        w._mark_clean()
+        w.close()
+
+        again = self._window()
+        self.assertTrue(again._is_dark(), "the appearance setting was not stored")
+        again._mark_clean()
+        again.close()
+
+    def test_the_menu_shows_which_appearance_is_active(self):
+        w = self._window()
+        for choice in ("light", "dark", "system"):
+            w.set_appearance(choice)
+            ticked = [k for k, a in w._appearance_actions.items() if a.isChecked()]
+            self.assertEqual(ticked, [choice])
+        w._mark_clean()
+        w.close()
+
+    def test_bold_and_underline_survive_an_appearance_change(self):
+        # ⚠️ STYLECLEARALL would wipe them; the guard is `_styled`.
+        from raggy.app import STYLE_BOLD
+        from PyQt6 import Qsci
+        w = self._window()
+        w.editor.setText("hello world\n")
+        w.editor.SendScintilla(Qsci.QsciScintilla.SCI_SETSEL, 0, 5)
+        w.toggle_bold()
+        w.set_appearance("dark")
+        styles = {w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSTYLEAT, i)
+                  for i in range(0, 5)}
+        self.assertEqual(styles, {STYLE_BOLD})
+        w._mark_clean()
+        w.close()
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestDialogTheming(unittest.TestCase):
+    """The Ask dialogs must not be grey-on-grey in dark mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_the_ask_dialog_follows_the_mode_it_is_given(self):
+        from PyQt6.QtGui import QPalette
+        from raggy.app import AskDialog
+        d = AskDialog()
+        d.apply_theme(True)
+        pal = d.palette()
+        self.assertEqual(pal.color(QPalette.ColorRole.Window).name(), "#252526")
+        self.assertEqual(pal.color(QPalette.ColorRole.Base).name(), "#1e1e1e")
+        self.assertEqual(pal.color(QPalette.ColorRole.Text).name(), "#e8e8e8")
+        d.close()
+
+    def test_the_setup_dialog_themes_the_same_way(self):
+        from PyQt6.QtGui import QPalette
+        from raggy.app import AISetupDialog
+        d = AISetupDialog()
+        d.apply_theme(True)
+        self.assertEqual(
+            d.palette().color(QPalette.ColorRole.Text).name(), "#e8e8e8")
+        d.close()
+
+    def test_muted_text_is_labelled_not_hard_coded(self):
+        # ⚠️ The old `color: palette(mid)` was grey on grey in dark mode. Muted
+        # labels now carry a role the theme styles.
+        from raggy.app import THEME, AskDialog
+        d = AskDialog()
+        self.assertEqual(d.status.property("role"), "muted")
+        d.apply_theme(True)
+        self.assertIn(THEME[True]["muted"], d.styleSheet())
+        d.apply_theme(False)
+        self.assertIn(THEME[False]["muted"], d.styleSheet())
+        d.close()
+
+    def test_the_two_modes_really_are_different(self):
+        from raggy.app import THEME
+        self.assertNotEqual(THEME[True]["muted"], THEME[False]["muted"])
+        self.assertNotEqual(THEME[True]["paper"], THEME[False]["paper"])
+
+    def test_a_connection_result_is_coloured_by_outcome(self):
+        from raggy.app import AISetupDialog
+        d = AISetupDialog()
+        d._set_result("Failed: nope", ok=False)
+        self.assertEqual(d.result_label.property("role"), "bad")
+        d._set_result("Working. The model said: \u201cOK\u201d", ok=True)
+        self.assertEqual(d.result_label.property("role"), "ok")
+        d._set_result("Trying\u2026")
+        self.assertEqual(d.result_label.property("role"), "")
+        d.close()
+
+    def test_the_ask_dialog_offers_to_copy_a_real_answer_only(self):
+        from raggy.app import AskDialog
+        d = AskDialog()
+        self.assertTrue(d.copy_btn.isHidden())
+        d.show_answer("Restart the worker [1].")
+        self.assertFalse(d.copy_btn.isHidden())
+        d.close()
+
+    def test_an_unconfigured_dialog_says_what_is_missing(self):
+        from raggy.app import AskDialog
+        d = AskDialog()
+        d.set_ai_configured(False)
+        self.assertFalse(d.setup_btn.isHidden())
+        self.assertIn("No model connected", d.status.text())
+        d.set_ai_configured(True, "llama3.2 at http://localhost:11434/v1")
+        self.assertTrue(d.setup_btn.isHidden())
+        self.assertIn("llama3.2", d.status.text())
+        d.close()
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestBoldUnderline(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from raggy.app import MainWindow
+        self.w = MainWindow()
+        self.w._index_timer.stop()
+        self.w._find_timer.stop()
+        self.w._save_timer.stop()
+        self.addCleanup(self._dispose)
+
+    def _dispose(self):
+        self.w._mark_clean()
+        self.w.close()
+
+    def _select(self, start_char, end_char):
+        """Select by CHARACTER offsets, converted to the bytes Scintilla wants.
+
+        ⚠️ Deliberately done in the test rather than through the app, so a bug in
+        the app's own conversion cannot hide itself.
+        """
+        from PyQt6 import Qsci
+        text = self.w.editor.text()
+        self.w.editor.SendScintilla(
+            Qsci.QsciScintilla.SCI_SETSEL,
+            len(text[:start_char].encode("utf-8")),
+            len(text[:end_char].encode("utf-8")))
+
+    def _styles(self, start_char, end_char):
+        from PyQt6 import Qsci
+        text = self.w.editor.text()
+        first = len(text[:start_char].encode("utf-8"))
+        last = len(text[:end_char].encode("utf-8"))
+        return {self.w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSTYLEAT, p)
+                for p in range(first, last)}
+
+    def test_bold_applies_and_toggles_off(self):
+        from raggy.app import STYLE_BOLD
+        from PyQt6 import Qsci
+        self.w.editor.setText("hello world\n")
+        self._select(0, 5)
+        self.w.toggle_bold()
+        self.assertEqual(self._styles(0, 5), {STYLE_BOLD})
+        self.w.toggle_bold()
+        self.assertEqual(self._styles(0, 5), {Qsci.QsciScintilla.STYLE_DEFAULT})
+
+    def test_bold_and_underline_combine(self):
+        from raggy.app import STYLE_BOLD_UNDERLINE
+        self.w.editor.setText("hello world\n")
+        self._select(0, 5)
+        self.w.toggle_bold()
+        self.w.toggle_underline()
+        self.assertEqual(self._styles(0, 5), {STYLE_BOLD_UNDERLINE})
+        self.w.toggle_bold()
+        from raggy.app import STYLE_UNDERLINE
+        self.assertEqual(self._styles(0, 5), {STYLE_UNDERLINE})
+
+    def test_styling_does_not_spill_onto_the_neighbours(self):
+        # ⚠️ The offsets are BYTES. With a multi-byte character inside the
+        # selection, a mistake here styles the wrong text — the same class of bug
+        # that once made the editor select the wrong passage for a search hit.
+        from PyQt6 import Qsci
+        from raggy.app import STYLE_BOLD
+        text = "caf\u00e9 na\u00efve \u2014 the end\n"
+        self.w.editor.setText(text)
+        start = text.index("na\u00efve")
+        end = start + len("na\u00efve")
+        self._select(start, end)
+        self.w.toggle_bold()
+        self.assertEqual(self._styles(start, end), {STYLE_BOLD})
+        plain = Qsci.QsciScintilla.STYLE_DEFAULT
+        self.assertEqual(self._styles(0, start), {0}, "text before it was styled")
+        self.assertEqual(self._styles(end, len(text) - 1), {0},
+                         "text after it was styled")
+
+    def test_nothing_selected_is_harmless(self):
+        self.w.editor.setText("hello\n")
+        from PyQt6 import Qsci
+        self.w.editor.SendScintilla(Qsci.QsciScintilla.SCI_SETSEL, 2, 2)
+        self.w.toggle_bold()          # must not raise, must not style anything
+
+    def test_the_menu_entries_exist_and_are_checkable(self):
+        edit = next(a.menu() for a in self.w.menuBar().actions()
+                    if a.text().replace("&", "") == "Edit")
+        labels = {a.text().replace("&", "") for a in edit.actions() if a.text()}
+        self.assertIn("Bold", labels)
+        self.assertIn("Underline", labels)
+        self.assertTrue(self.w._bold_action.isCheckable())
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestRename(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from raggy.app import MainWindow
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.w = MainWindow()
+        self.w._index_timer.stop()
+        self.w._find_timer.stop()
+        self.w._save_timer.stop()
+        self.addCleanup(self._dispose)
+
+    def _dispose(self):
+        self.w._mark_clean()
+        self.w.close()
+
+    def _loaded(self, name="notes.txt", body="hello\n"):
+        path = self.dir / name
+        path.write_text(body, encoding="utf-8")
+        self.w.load_path(str(path), warn_encoding=False)
+        return path
+
+    def _rename_to(self, name):
+        from unittest import mock
+        from raggy import app as app_module
+        with mock.patch.object(app_module.QInputDialog, "getText",
+                               return_value=(name, True)):
+            return self.w.rename_document()
+
+    def test_it_renames_the_file_on_disk_and_follows_it(self):
+        old = self._loaded()
+        self.assertTrue(self._rename_to("renamed.txt"))
+        self.assertFalse(old.exists())
+        self.assertTrue((self.dir / "renamed.txt").exists())
+        self.assertEqual(self.w.path, str(self.dir / "renamed.txt"))
+        self.assertIn("renamed.txt", self.w.windowTitle())
+
+    def test_a_cancelled_prompt_changes_nothing(self):
+        from unittest import mock
+        from raggy import app as app_module
+        old = self._loaded()
+        with mock.patch.object(app_module.QInputDialog, "getText",
+                               return_value=("whatever.txt", False)):
+            self.assertFalse(self.w.rename_document())
+        self.assertTrue(old.exists())
+        self.assertEqual(self.w.path, str(old))
+
+    def test_a_separator_is_refused(self):
+        # ⚠️ Otherwise "Rename" silently becomes "move the file elsewhere".
+        from unittest import mock
+        from raggy import app as app_module
+        old = self._loaded()
+        with mock.patch.object(app_module.QMessageBox, "warning") as warned:
+            self.assertFalse(self._rename_to("sub/dir.txt"))
+        self.assertTrue(old.exists(), "the file was moved anyway")
+        self.assertTrue(warned.called)
+
+    def test_an_existing_name_is_refused(self):
+        from unittest import mock
+        from raggy import app as app_module
+        self._loaded("taken.txt", "other\n")
+        old = self._loaded("notes.txt")
+        with mock.patch.object(app_module.QMessageBox, "warning") as warned:
+            self.assertFalse(self._rename_to("taken.txt"))
+        self.assertTrue(old.exists())
+        self.assertTrue(warned.called)
+
+    def test_an_untitled_document_falls_back_to_save_as(self):
+        called = []
+        self.w.save_as = lambda: called.append(1) or False
+        self.assertFalse(self.w.rename_document())
+        self.assertEqual(called, [1])
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestFormulaPreviewUI(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from raggy.app import MainWindow
+        self.w = MainWindow()
+        self.w._index_timer.stop()
+        self.w._find_timer.stop()
+        self.w._save_timer.stop()
+        self.addCleanup(self._dispose)
+
+    def _dispose(self):
+        self.w._mark_clean()
+        self.w.close()
+
+    def _caret_after(self, snippet):
+        from PyQt6 import Qsci
+        text = self.w.editor.text()
+        char = text.index(snippet) + len(snippet)
+        self.w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GOTOPOS,
+                                    len(text[:char].encode("utf-8")))
+        self.w._update_formula_preview()
+
+    def test_the_bar_appears_on_a_formula_and_leaves_on_prose(self):
+        self.w.editor.setText("notes\n\nE = mc^2\n\nplain words\n")
+        self._caret_after("E = mc^2")
+        self.assertFalse(self.w.formula_bar.isHidden())
+        self.assertEqual(self.w.formula_bar.kind.text(), "equation")
+        self.assertIn("<sup>2</sup>", self.w.formula_bar.render.text())
+
+        self._caret_after("plain words")
+        self.assertTrue(self.w.formula_bar.isHidden())
+
+    def test_chemistry_renders_as_subscripts(self):
+        self.w.editor.setText("2H2 + O2 -> 2H2O\n")
+        self._caret_after("2H2 + O2 -> 2H2O")
+        self.assertEqual(self.w.formula_bar.kind.text(), "chemical")
+        self.assertIn("<sub>2</sub>", self.w.formula_bar.render.text())
+        self.assertIn("\u2192", self.w.formula_bar.render.text())
+
+    def test_the_caret_offset_is_characters_not_bytes(self):
+        # ⚠️ Scintilla speaks bytes; the formula module speaks characters. A
+        # document with multi-byte text before the formula would otherwise look up
+        # the wrong place.
+        self.w.editor.setText("caf\u00e9 \u2014 \n\nE = mc^2\n")
+        self._caret_after("E = mc^2")
+        self.assertEqual(self.w.formula_bar.kind.text(), "equation")
+
+    def test_it_can_be_turned_off_and_the_menu_follows(self):
+        self.w.editor.setText("E = mc^2\n")
+        self._caret_after("E = mc^2")
+        self.assertFalse(self.w.formula_bar.isHidden())
+        self.w.set_formula_preview(False)
+        self.assertTrue(self.w.formula_bar.isHidden())
+        self.assertFalse(self.w._formula_action.isChecked())
+        self.w.set_formula_preview(True)
+        self.assertFalse(self.w.formula_bar.isHidden())
+        self.assertTrue(self.w._formula_action.isChecked())
+
+    def test_an_empty_document_is_harmless(self):
+        self.w.editor.setText("")
+        self.w._update_formula_preview()
+        self.assertTrue(self.w.formula_bar.isHidden())
+
+    def test_the_bar_is_not_a_splitter_or_a_tab(self):
+        # The window is still one plain pane with a transient strip.
+        from PyQt6.QtWidgets import QSplitter, QTabWidget
+        self.assertEqual(self.w.findChildren(QSplitter), [])
+        self.assertEqual(self.w.findChildren(QTabWidget), [])
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
