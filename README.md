@@ -42,6 +42,41 @@ Cmd+Shift+F  "how do I fix an expired certificate on a replica"
      (Find… for "expired certificate": No matches)
 ```
 
+### Chunk size is what breaks semantic search, not the model
+
+⚠️ The most serious bug this project has had, because every part of it was silent.
+`_pack_spans` decides where to **stop** packing; it had no way to **split** a unit
+that was already larger than the target, and emitted those whole. On a real 946 KB
+notes file that produced:
+
+```
+160 chunks · mean 5,925 chars · p95 30,729 · max 237,315
+```
+
+One chunk was a quarter of the entire document, and three things then failed at
+once without a single error:
+
+- **The encoder truncates at 512 tokens**, so ~99% of an oversized chunk was never
+  embedded. The text was *in the index* and invisible to the dense retriever.
+- **BM25 length normalisation** buried the terms in a chunk that size, so lexical
+  search could not cover for it.
+- **Every batch padded to 512 tokens** — which is why indexing also looked fast.
+
+The reported symptom was a query whose answer is in the file verbatim returning
+passages about VGG16 and `collate_fn` instead. After the fix the same file gives
+2,140 chunks (mean 452, p95 596, **max exactly 600**) and that query returns the
+right passage at **rank 1**.
+
+**The lesson worth more than the fix:** our own 19-query eval passed throughout,
+because the sample handbook is 9 KB with **zero headings** — it never reached the
+oversized path, so the fixture could not produce the failing condition. The
+regression tests now build documents that look like real notes (one heading over a
+huge section, an unbroken 50,000-character run, text with no sentence stops).
+
+**Cost.** First index of that 946 KB file takes ~60-80 s on CPU: 2,140 chunks ×
+~10 ms is simply what embedding a book costs. Editing afterwards re-encodes only
+the changed passages, which is the incremental path below.
+
 ### Keyboard
 
 | | |
@@ -320,7 +355,7 @@ from **Help ▸ Enable Search by Meaning…**.
 ./run.sh install      # .venv with the full app stack (engine + GUI + ONNX)
 ./run.sh app          # launch the editor
 ./run.sh demo         # offline engine tour — no GUI, no model, no key
-./run.sh test         # 323 tests
+./run.sh test         # 331 tests
 ```
 
 ### Just the engine, no Qt
@@ -486,7 +521,7 @@ answer.
 
 ## Verified / not verified
 
-✅ **323 tests pass** (`./run.sh test`), hermetic — no network, no model download,
+✅ **331 tests pass** (`./run.sh test`), hermetic — no network, no model download,
 and the app's settings redirected into a scratch directory via
 `RAGGY_SETTINGS_DIR` so nothing touches your real preferences. ⚠️
 `QSettings.setPath()` is NOT enough on macOS: Qt ignores it and writes to
