@@ -139,12 +139,50 @@ def _span_heading_blocks(text: str) -> list[tuple[int, int]]:
     return blocks
 
 
+#: How many times one oversized unit may be re-split before giving up and cutting
+#: it by characters. See _split_unit.
+_MAX_SPLIT_DEPTH = 3
+
+
+def _split_unit(text: str, start: int, end: int, target: int, overlap: int,
+                depth: int) -> list[tuple[int, int]]:
+    """Break ONE unit that is larger than the target, using finer boundaries.
+
+    Paragraphs first, then sentences, then raw characters — the same order the
+    strategies themselves use, applied one level down.
+    """
+    piece = text[start:end]
+    for finer in (_span_paragraphs, _span_sentences):
+        inner = finer(piece)
+        if len(inner) > 1:
+            moved = [(a + start, b + start) for a, b in inner]
+            return _pack_spans(text, moved, target, overlap, depth + 1)
+    # Nothing finer to work with (one enormous unbroken run of text).
+    return [(a + start, b + start)
+            for a, b in _fixed_spans(piece, target, overlap)]
+
+
 def _pack_spans(text: str, spans: list[tuple[int, int]], target: int,
-                overlap: int) -> list[tuple[int, int]]:
+                overlap: int, depth: int = 0) -> list[tuple[int, int]]:
     """Greedily pack units up to ~`target` chars, carrying `overlap` forward.
 
     Overlap exists so an answer that straddles a boundary is still fully inside
     at least one chunk. ⚠️ It is not free: it duplicates text in the index.
+
+    ⚠️ PACKING CAN ONLY DECIDE WHERE TO STOP. It cannot break a unit that is
+    ALREADY larger than the target, and the loop below silently emitted those
+    whole. On a real 946 KB notes file that produced chunks of 5,925 characters on
+    average, p95 of 30,729, and a single 237,315-character "passage" — a quarter of
+    the document. Three things then went wrong at once, all silently:
+
+      * the encoder truncates at 512 tokens, so ~99% of that chunk was never
+        embedded at all — the text was in the index and invisible to the dense
+        retriever;
+      * BM25's length normalisation washed the terms out of an enormous chunk, so
+        the lexical half could not rescue it either;
+      * indexing was slow, because every batch padded to 512 tokens.
+
+    So a unit bigger than the target is split further before it is packed.
     """
     if not spans:
         return []
@@ -153,6 +191,10 @@ def _pack_spans(text: str, spans: list[tuple[int, int]], target: int,
     while i < n:
         start = spans[i][0]
         end = spans[i][1]
+        if end - start > target and depth < _MAX_SPLIT_DEPTH:
+            out.extend(_split_unit(text, start, end, target, overlap, depth))
+            i += 1
+            continue
         j = i
         # Extend while the whole span still fits.
         while j + 1 < n and spans[j + 1][1] - start <= target:
