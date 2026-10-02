@@ -6,25 +6,40 @@ Every editor's Find matches *characters*. That is exactly right for
 `ERR_CONN_4421` and exactly wrong for *"how do I stop the service falling over"* —
 a question that shares no words with the passage that answers it.
 
-RaggyEditor is a desktop text editor with **one search box**. Press `Cmd+F`, get
-a TextEdit-style find bar, and type — the same field returns the words you typed
-**and** the passages that mean the same thing:
+RaggyEditor is a desktop text editor with **two search commands**, because one
+command cannot honestly do both jobs:
 
-| In the find bar | Result |
-|---|---|
-| `ERR_CONN_4421` | the exact matches, as any editor finds them |
-| *how do I stop it falling over?* | the passages about it, though they share no words |
+| | | |
+|---|---|---|
+| `Cmd+F` | **Find…** | matches characters, as any editor does |
+| `Cmd+Shift+F` | **Semantic Find…** | matches meaning |
 
-There is no separate "semantic search" mode to switch to and no extra panel.
-`Enter` / `Shift+Enter` (or the chevrons) walk through every match; the document
-highlights them; **Done** closes the bar.
+Both use the same TextEdit-style bar above the document, and there is still no
+side panel. `Enter` / `Shift+Enter` (or the chevrons) walk the results; **Done**
+closes the bar.
+
+⚠️ **THE TWO ARE SEPARATE, AND THEIR RESULTS ARE NEVER MIXED.** An earlier version
+fused them into one box, and in use that was nonsense: the count read
+`3 of 12 · 4 exact · 8 related`, one number adding up two unrelated things;
+next/previous stepped between a literal hit and a passage from the other end of
+the document; and searching for a string you could see on screen could land you
+somewhere else entirely. So:
+
+- **Find…** returns literal matches only — never a "close enough" passage. If the
+  words are not there, it says `No matches`, which is the truth.
+- **Semantic Find…** returns passages that resemble the query, and nothing that
+  merely contains the string. It never replaces text: a passage that is *about*
+  the subject is not an occurrence of it, and replacing one would rewrite
+  something nobody searched for.
+- The literal-only controls (regex, match case, whole word, Replace) are hidden in
+  Semantic Find, because they mean nothing there.
 
 ```
-Cmd+F  "how do I fix an expired certificate on a replica"
-  1 of 21   ·   0 exact · 21 related
+Cmd+Shift+F  "how do I fix an expired certificate on a replica"
+  Semantic  ·  1 of 21 related passages
   → jumps to line 61:  "ERR_CONN_4422  The connection was established but the
                         handshake did not complete…"
-     (ordinary Find for "expired certificate": nothing)
+     (Find… for "expired certificate": No matches)
 ```
 
 ### Keyboard
@@ -33,7 +48,8 @@ Cmd+F  "how do I fix an expired certificate on a replica"
 |---|---|
 | `Cmd+N` / `Cmd+O` / `Cmd+S` / `Cmd+Shift+S` | New window · Open · Save · Save As |
 | `Cmd+Shift+R` | Rename the file on disk |
-| `Cmd+F` | Find (exact **and** meaning) |
+| `Cmd+F` | Find (literal / regex) |
+| `Cmd+Shift+F` | Semantic Find (by meaning) |
 | `Cmd+Alt+F` | Find and Replace |
 | `Cmd+G` / `Cmd+Shift+G` | Find next / previous |
 | `Cmd+E` | Use selection for find |
@@ -304,7 +320,7 @@ from **Help ▸ Enable Search by Meaning…**.
 ./run.sh install      # .venv with the full app stack (engine + GUI + ONNX)
 ./run.sh app          # launch the editor
 ./run.sh demo         # offline engine tour — no GUI, no model, no key
-./run.sh test         # 317 tests
+./run.sh test         # 323 tests
 ```
 
 ### Just the engine, no Qt
@@ -470,7 +486,7 @@ answer.
 
 ## Verified / not verified
 
-✅ **317 tests pass** (`./run.sh test`), hermetic — no network, no model download,
+✅ **323 tests pass** (`./run.sh test`), hermetic — no network, no model download,
 and the app's settings redirected into a scratch directory via
 `RAGGY_SETTINGS_DIR` so nothing touches your real preferences. ⚠️
 `QSettings.setPath()` is NOT enough on macOS: Qt ignores it and writes to

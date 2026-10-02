@@ -102,7 +102,11 @@ STYLE_FLAGS = {
 STYLE_BITS = 0x1F
 MAX_RECENT = 10
 
-FIND_PLACEHOLDER = "Find — words, or describe what you mean"
+FIND_PLACEHOLDER = "Find — words, or a regular expression"
+#: ⚠️ The old shared placeholder ("words, OR describe what you mean") described a
+#: box that returned both kinds at once. That is exactly what is being split, so
+#: each box now says only what it does.
+SEMANTIC_PLACEHOLDER = "Semantic find — describe what you mean, not the exact words"
 
 # =============================================================================
 # THE TWO PALETTES
@@ -596,6 +600,8 @@ if HAS_QT:
 
         def __init__(self):
             super().__init__()
+            #: "exact" (literal or regex) or "meaning" (semantic). See set_mode.
+            self.mode = "exact"
             self.setFrameShape(QFrame.Shape.NoFrame)
             # ⚠️ `palette(window)` looked fine in light mode and gave dark grey on
             # dark grey in dark mode. The bar is now themed from THEME with
@@ -732,6 +738,30 @@ if HAS_QT:
                 " border-bottom: 1px solid %(border)s; }" % c
                 + DIALOG_QSS[dark] % c)
             return dark
+
+        def set_mode(self, mode: str):
+            """Switch between literal Find and Semantic Find.
+
+            ⚠️ THEY ARE SEPARATE COMMANDS ON PURPOSE. One box that returned both
+            literal matches and passages that merely RESEMBLE the query made the
+            two indistinguishable in practice: the count read as a single list,
+            next/previous walked between kinds, and searching for a string you can
+            see on screen could land you on a passage from somewhere else. The two
+            are never mixed now.
+            """
+            mode = "meaning" if mode == "meaning" else "exact"
+            self.mode = mode
+            if mode == "meaning":
+                self.field.setPlaceholderText(SEMANTIC_PLACEHOLDER)
+                # Regex, case and whole-word are properties of LITERAL matching and
+                # mean nothing to a meaning search.
+                self.disclosure.hide()
+                self.show_replace(False)
+            else:
+                self.field.setPlaceholderText(FIND_PLACEHOLDER)
+                self.disclosure.show()
+            for button in (self.case_btn, self.word_btn, self.regex_btn):
+                button.setVisible(mode == "exact")
 
         def set_status(self, text: str):
             self.status.setText(text)
@@ -1068,6 +1098,10 @@ if HAS_QT:
 
             d = m.addMenu("&Find")
             self._act(d, "&Find…", QKeySequence.StandardKey.Find, self.show_find)
+            # ⚠️ Deliberately its own command right below Find…, not a toggle
+            # inside it: they answer different questions ("where is this text" vs
+            # "where is this discussed") and their results must never be mixed.
+            self._act(d, "&Semantic Find…", "Ctrl+Shift+F", self.show_semantic_find)
             self._act(d, "Find and &Replace…", "Ctrl+Alt+F", self.show_replace)
             self._act(d, "Find &Next", QKeySequence.StandardKey.FindNext, self._next)
             self._act(d, "Find &Previous", QKeySequence.StandardKey.FindPrevious, self._prev)
@@ -2013,9 +2047,11 @@ if HAS_QT:
             text = self.editor.text()
             return text[a:b] if 0 <= a < b <= len(text) else ""
 
-        def show_find(self, with_replace: bool = False):
+        def show_find(self, with_replace: bool = False, mode: str = "exact"):
+            """Open the bar in one of its two modes. See ShowSemanticFind."""
+            self.find_bar.set_mode(mode)
             self.find_bar.show()
-            if with_replace:
+            if with_replace and mode == "exact":
                 self.find_bar.show_replace(True)
             sel = self._selected_text()
             if sel and "\n" not in sel and not self.find_bar.query():
@@ -2025,8 +2061,22 @@ if HAS_QT:
             if self.find_bar.query():
                 self._run_search()
 
+        def show_semantic_find(self):
+            """Find by meaning, as its own command.
+
+            ⚠️ SEPARATE FROM Find… BECAUSE ONE BOX COULD NOT DO BOTH HONESTLY. A
+            single field returned literal occurrences AND passages that merely
+            resembled the query, fused into one list — so "3 of 12" counted two
+            unrelated things, next/previous stepped between them, and a search for
+            a string the user could see on screen could put the caret on a passage
+            from the other end of the document. Splitting them also makes the
+            result honest: everything in this mode is a passage that means
+            something like the query, and nothing here is an exact occurrence.
+            """
+            self.show_find(mode="meaning")
+
         def show_replace(self):
-            self.show_find(with_replace=True)
+            self.show_find(with_replace=True, mode="exact")
 
         def _close_find(self):
             self.find_bar.hide()
@@ -2037,6 +2087,7 @@ if HAS_QT:
         def _use_selection(self):
             sel = self._selected_text()
             if sel and "\n" not in sel:
+                self.find_bar.set_mode("exact")     # a literal string, not a meaning
                 self.find_bar.show()
                 self.find_bar.field.setText(sel)
                 self.find_bar.field.setFocus()
@@ -2046,6 +2097,12 @@ if HAS_QT:
             self._find_timer.start()
 
         def _run_search(self):
+            """Run whichever of the two searches the bar is in.
+
+            ⚠️ The two modes are never combined. Earlier this method built
+            `exact + related` as a single result list; see show_semantic_find for
+            why that read as nonsense in use.
+            """
             query = self.find_bar.query()
             self._clear_indicators()
             self._results = []
@@ -2057,28 +2114,51 @@ if HAS_QT:
                 self.find_bar.set_replace_enabled(False, "Search for something first")
                 return
 
+            if self.find_bar.mode == "meaning":
+                self._run_semantic_search(query)
+            else:
+                self._run_exact_search(query)
+
+        def _run_exact_search(self, query: str):
+            """Literal (or regex) matching only."""
             exact = self._exact_matches(query)
             if exact is None:
                 self.find_bar.set_replace_enabled(False, "Fix the expression first")
                 return                          # bad regex; message already shown
-            related = self._related_passages(query)
-            seen = {(r["start"], r["end"]) for r in exact}
-            self._results = exact + [r for r in related
-                                     if (r["start"], r["end"]) not in seen]
-
-            # ⚠️ Only literal matches can be replaced. "Related" passages are
-            # about the same subject, not occurrences of the query string, so
-            # replacing them would rewrite text the user never searched for.
+            self._results = exact
             self.find_bar.set_replace_enabled(
                 bool(exact),
-                "Nothing to replace — no exact matches for this search")
-
+                "Nothing to replace — no matches for this search")
             self._highlight()
             self._update_status()
             if self._results:
                 self._select_current()
 
-            if not exact and self._should_offer_meaning():
+        def _run_semantic_search(self, query: str):
+            """Meaning only: passages that resemble the query, ranked.
+
+            ⚠️ Replace is refused here for good. A related passage is not an
+            occurrence of the query, so replacing it would rewrite text the user
+            never searched for.
+            """
+            self.find_bar.set_replace_enabled(False, "Semantic find does not replace text")
+
+            # ⚠️ `engine.is_indexed`, NOT `self._indexed_text`. The latter is a
+            # UI-side copy filled in when the worker's signal is delivered, so a
+            # perfectly good index reported "Indexing the document…" for as long as
+            # that signal was in flight.
+            if not self.engine.is_indexed:
+                # `_indexed` re-runs the search once it lands, and re-branches on
+                # the mode, so nothing has to be remembered here.
+                self.find_bar.set_status("Indexing the document…")
+                return
+
+            self._results = self._related_passages(query)
+            self._highlight()
+            self._update_status()
+            if self._results:
+                self._select_current()
+            elif self._should_offer_meaning():
                 self._offer_meaning_search()
 
         def _exact_matches(self, query: str) -> list[dict] | None:
@@ -2105,7 +2185,12 @@ if HAS_QT:
             return out
 
         def _related_passages(self, query: str) -> list[dict]:
-            if not self._indexed_text or not self.engine.is_indexed:
+            # ⚠️ `engine.is_indexed`, NOT `self._indexed_text`. The engine is the
+            # authority on whether an index exists; `_indexed_text` is only set when
+            # the worker's completion signal is DELIVERED, so gating on it returned
+            # an empty list — "no related passages" — for a document that was
+            # indexed and searchable the whole time.
+            if not self.engine.is_indexed:
                 return []
             try:
                 res = self.engine.semantic_search(query, k=15)
@@ -2171,21 +2256,29 @@ if HAS_QT:
                 pass
 
         def _update_status(self):
+            """Counts are per mode, and say which mode they belong to.
+
+            ⚠️ A single fused count was the visible symptom of the old design:
+            "3 of 12" mixed literal hits with passages that merely resembled the
+            query. Nothing is fused now, so the number means one thing.
+            """
             n = len(self._results)
+            semantic = self.find_bar.mode == "meaning"
             if not n:
-                self.find_bar.set_status(
-                    "Indexing…" if not self._indexed_text else "No matches")
+                if semantic:
+                    self.find_bar.set_status(
+                        "No related passages" if self.engine.is_indexed
+                        else "Indexing the document…")
+                else:
+                    self.find_bar.set_status("No matches")
                 return
-            exact = sum(1 for r in self._results if r["kind"] == "match")
-            related = n - exact
-            parts = [f"{self._current + 1} of {n}"]
-            if exact and related:
-                parts.append(f"{exact} exact · {related} related")
-            elif related:
-                parts.append(f"{related} related")
-            else:
-                parts.append(f"{exact} matches")
-            self.find_bar.set_status("  ·  ".join(parts))
+            if semantic:
+                low = "  ·  weak matches" if self._semantic_low else ""
+                self.find_bar.set_status(
+                    f"Semantic  ·  {self._current + 1} of {n} related passage"
+                    f"{'s' if n != 1 else ''}{low}")
+                return
+            self.find_bar.set_status(f"{self._current + 1} of {n} matches")
 
         # ---------------------------------------------------------- navigation
         def _select_current(self):

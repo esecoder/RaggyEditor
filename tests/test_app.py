@@ -62,8 +62,12 @@ class TestDesktopApp(unittest.TestCase):
         w.editor.setModified(False)                  # so close() cannot prompt
         return w
 
-    def _search(self, w, query):
-        w.show_find()
+    def _search(self, w, query, mode="exact"):
+        """Run ONE of the two searches. They are never combined any more."""
+        if mode == "meaning":
+            w.show_semantic_find()
+        else:
+            w.show_find()
         w.find_bar.field.setText(query)
         w._find_timer.stop()
         w._run_search()
@@ -139,27 +143,95 @@ class TestDesktopApp(unittest.TestCase):
         self.assertTrue(w.find_bar.isHidden())
         w.close()
 
-    # ---- the unified search ----------------------------------------------
-    def test_exact_matches_are_found(self):
+    # ---- the two separate searches ---------------------------------------
+    def test_find_returns_literal_matches(self):
         w = self._window()
         res = self._search(w, "ERR_CONN_4421")
         self.assertGreaterEqual(len(res), 1)
-        self.assertTrue(any(r["kind"] == "match" for r in res))
+        self.assertTrue(all(r["kind"] == "match" for r in res))
         w.close()
 
-    def test_paraphrase_returns_related_passages(self):
+    def test_semantic_find_returns_related_passages(self):
+        w = self._window()
+        res = self._search(w, "how do I fix an expired certificate on a replica",
+                           mode="meaning")
+        self.assertTrue(res)
+        self.assertTrue(all(r["kind"] == "related" for r in res))
+        w.close()
+
+    def test_find_does_NOT_return_meaning_matches(self):
+        # ⚠️ THE REASON FOR THE SPLIT. This query shares no words with the passage
+        # that answers it, so a literal search must find nothing — and must NOT
+        # quietly pad the list with passages that merely resemble it.
         w = self._window()
         res = self._search(w, "how do I fix an expired certificate on a replica")
-        self.assertTrue(res)
-        self.assertTrue(any(r["kind"] == "related" for r in res))
+        self.assertEqual(res, [], "Find… returned a meaning match")
         w.close()
 
-    def test_one_search_box_can_return_both_kinds(self):
+    def test_semantic_find_does_NOT_return_literal_only_matches(self):
+        # The mirror image: an identifier is not a meaning. Nothing here is
+        # returned as a "match", because this mode does not match strings.
         w = self._window()
-        res = self._search(w, "replication lag")
-        kinds = {r["kind"] for r in res}
-        self.assertIn("related", kinds)
-        self.assertIn("match", kinds)
+        res = self._search(w, "ERR_CONN_4421", mode="meaning")
+        self.assertTrue(all(r["kind"] == "related" for r in res))
+        w.close()
+
+    def test_the_two_modes_use_different_placeholders(self):
+        w = self._window()
+        w.show_find()
+        literal = w.find_bar.field.placeholderText()
+        w.show_semantic_find()
+        self.assertNotEqual(w.find_bar.field.placeholderText(), literal)
+        w.close()
+
+    def test_semantic_mode_hides_the_literal_only_controls(self):
+        # Case, whole-word and regex describe LITERAL matching and mean nothing to
+        # a meaning search, so they are not shown next to one.
+        w = self._window()
+        w.show_find()
+        self.assertFalse(w.find_bar.regex_btn.isHidden())
+        self.assertFalse(w.find_bar.disclosure.isHidden())
+        w.show_semantic_find()
+        for button in (w.find_bar.regex_btn, w.find_bar.case_btn, w.find_bar.word_btn):
+            self.assertTrue(button.isHidden(), "a literal-only control is showing")
+        self.assertTrue(w.find_bar.disclosure.isHidden())
+        w.close()
+
+    def test_find_restores_the_literal_controls(self):
+        w = self._window()
+        w.show_semantic_find()
+        w.show_find()
+        self.assertFalse(w.find_bar.regex_btn.isHidden())
+        self.assertFalse(w.find_bar.disclosure.isHidden())
+        w.close()
+
+    def test_semantic_find_never_offers_to_replace(self):
+        # ⚠️ A related passage is not an occurrence of the query. Replacing it
+        # would rewrite text the user never searched for.
+        w = self._window()
+        self._search(w, "how do I fix an expired certificate on a replica",
+                     mode="meaning")
+        self.assertFalse(w.find_bar.replace_btn.isEnabled())
+        before = w.editor.text()
+        w._do_replace("XXX", True)
+        self.assertEqual(w.editor.text(), before, "it replaced a meaning match!")
+        w._mark_clean()      # clears BOTH dirty flags
+        w.close()
+
+    def test_the_two_menu_commands_open_the_two_modes(self):
+        w = self._window()
+        find_menu = next(a.menu() for a in w.menuBar().actions()
+                         if a.text().replace("&", "") == "Find")
+        labels = [a.text().replace("&", "") for a in find_menu.actions() if a.text()]
+        # The new command sits immediately after Find…
+        self.assertEqual(labels[:3], ["Find…", "Semantic Find…", "Find and Replace…"])
+
+        by_label = {a.text().replace("&", ""): a for a in find_menu.actions() if a.text()}
+        by_label["Semantic Find…"].trigger()
+        self.assertEqual(w.find_bar.mode, "meaning")
+        by_label["Find…"].trigger()
+        self.assertEqual(w.find_bar.mode, "exact")
+        w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
     def test_regex_toggle_changes_matching(self):
@@ -191,14 +263,19 @@ class TestDesktopApp(unittest.TestCase):
         # and Scintilla reports UTF-8 bytes, so the numbers legitimately differ on
         # any document with a non-ASCII character (this sample has several).
         from PyQt6 import Qsci
-        w = self._window()
-        res = self._search(w, "how do I fix an expired certificate on a replica")
-        r = res[0]
-        start = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSELECTIONSTART)
-        end = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSELECTIONEND)
-        selected = self.text.encode("utf-8")[start:end].decode("utf-8")
-        self.assertEqual(selected, self.text[r["start"]:r["end"]])
-        w.close()
+        for mode in ("exact", "meaning"):
+            w = self._window()
+            query = ("ERR_CONN" if mode == "exact"
+                     else "how do I fix an expired certificate on a replica")
+            res = self._search(w, query, mode=mode)
+            self.assertTrue(res, f"no results in {mode} mode")
+            r = res[0]
+            start = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSELECTIONSTART)
+            end = w.editor.SendScintilla(Qsci.QsciScintilla.SCI_GETSELECTIONEND)
+            selected = self.text.encode("utf-8")[start:end].decode("utf-8")
+            self.assertEqual(selected, self.text[r["start"]:r["end"]],
+                             f"wrong text selected in {mode} mode")
+            w.close()
 
     def test_next_wraps_around(self):
         w = self._window()
@@ -212,12 +289,20 @@ class TestDesktopApp(unittest.TestCase):
         self.assertEqual(w._current, n - 1)
         w.close()
 
-    def test_status_reports_both_counts(self):
+    def test_the_status_count_belongs_to_one_mode(self):
+        # ⚠️ "3 of 12 · 4 exact · 8 related" was the visible symptom of the old
+        # design: one number counting two unrelated things.
         w = self._window()
-        self._search(w, "replication lag")
-        text = w.find_bar.status.text()
-        self.assertIn("exact", text)
-        self.assertIn("related", text)
+        self._search(w, "replication")
+        literal = w.find_bar.status.text()
+        self.assertIn("matches", literal)
+        self.assertNotIn("related", literal)
+
+        self._search(w, "how do I fix an expired certificate on a replica",
+                     mode="meaning")
+        semantic = w.find_bar.status.text()
+        self.assertIn("related", semantic)
+        self.assertNotIn("matches", semantic)
         w.close()
 
     def test_use_selection_for_find(self):
@@ -296,12 +381,22 @@ class TestTextEditDetails(unittest.TestCase):
             self.assertEqual(w.editor.marginWidth(m), 0, f"margin {m} is visible")
         w.close()
 
-    def test_find_field_placeholder_describes_what_find_can_do(self):
-        from raggy.app import FIND_PLACEHOLDER
+    def test_each_mode_has_a_placeholder_that_describes_only_its_own_job(self):
+        # ⚠️ The old shared copy said "words, OR describe what you mean", which
+        # advertised a box returning both kinds at once. That box is gone, so the
+        # text had to change with it.
+        from raggy.app import FIND_PLACEHOLDER, SEMANTIC_PLACEHOLDER
         w = self._window()
+
+        w.show_find()
         self.assertEqual(w.find_bar.field.placeholderText(), FIND_PLACEHOLDER)
         self.assertIn("words", FIND_PLACEHOLDER.lower())
-        self.assertIn("mean", FIND_PLACEHOLDER.lower())
+        self.assertNotIn("mean", FIND_PLACEHOLDER.lower(),
+                         "Find… still advertises meaning search")
+
+        w.show_semantic_find()
+        self.assertEqual(w.find_bar.field.placeholderText(), SEMANTIC_PLACEHOLDER)
+        self.assertIn("mean", SEMANTIC_PLACEHOLDER.lower())
         w.close()
 
     def test_file_menu_has_new(self):
@@ -502,13 +597,14 @@ class TestEditorFeatures(unittest.TestCase):
         w._mark_clean()      # clears BOTH dirty flags
         w.close()
 
-    def test_replace_is_refused_when_only_meaning_matches_exist(self):
-        # ⚠️ A "related" passage is about the same subject, not an occurrence of
-        # the query. Replacing it would rewrite text the user never searched for.
+    def test_find_does_not_replace_what_it_did_not_match(self):
+        # ⚠️ A query with no literal occurrence must produce NOTHING in Find…, so
+        # there is nothing to replace. Previously this query returned a "related"
+        # passage — which is about the same subject, not an occurrence of the
+        # string — and replacing it would have rewritten text nobody searched for.
         w = self._window("the queue backed up and the worker stalled\n")
         res = self._search(w, "service fell over")
-        self.assertTrue(res)
-        self.assertTrue(all(r["kind"] == "related" for r in res))
+        self.assertEqual(res, [])
         self.assertFalse(w.find_bar.replace_btn.isEnabled())
         before = w.editor.text()
         w._do_replace("XXX", True)
