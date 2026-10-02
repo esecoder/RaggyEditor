@@ -32,6 +32,8 @@ It also uses `tokenizers` directly rather than `transformers`, because
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from raggy import model_store
@@ -76,6 +78,15 @@ class OnnxEncoder:
         self._inputs = {i.name for i in self.session.get_inputs()}
         self._outputs = [o.name for o in self.session.get_outputs()]
 
+        # ⚠️ ONE ENCODER IS SHARED BY EVERY WINDOW (see encoder.shared_encoder), and
+        # windows index on their own background threads, so this object is entered
+        # concurrently. onnxruntime's run() and the tokenizer are both documented
+        # as safe to call from several threads, but the failure mode if that is
+        # ever not true is not a crash — it is a garbled vector, which produces
+        # results that look plausible and are wrong. Serialising costs little here
+        # (it also stops two windows fighting over the same CPU cores).
+        self._lock = threading.Lock()
+
         # Probe the dimensionality rather than hard-coding 384: a different model
         # in the same slot must not silently reshape the index.
         self.dim = int(self._forward([""]).shape[1])
@@ -84,6 +95,10 @@ class OnnxEncoder:
     def _forward(self, texts: list[str]) -> np.ndarray:
         if not texts:
             return np.zeros((0, self.dim if hasattr(self, "dim") else 1), dtype=np.float32)
+        with self._lock:
+            return self._forward_locked(texts)
+
+    def _forward_locked(self, texts: list[str]) -> np.ndarray:
         encs = self.tokenizer.encode_batch(texts)
         feed = {
             "input_ids": np.array([e.ids for e in encs], dtype=np.int64),

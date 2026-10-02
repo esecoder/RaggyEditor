@@ -33,9 +33,57 @@ returns results, they are just wrong, and nothing errors. `SearchIndex` carries
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 
 from raggy.retrievers import DEFAULT_ENCODER, NeuralIndex
+
+# =============================================================================
+# SHARED NEURAL ENCODERS
+# =============================================================================
+# Every editor window owns its own RaggyEngine, and an engine resolves its own
+# encoder. Building a fresh neural encoder per window means a fresh ONNX session
+# (or torch model) per window: tens of megabytes and a model load each, so ten
+# open documents would hold ten copies of the same weights.
+#
+# ⚠️ ONLY NEURAL ENCODERS ARE SHARED. LSA is not an object at all here — it is
+# `encoder=None`, and the index fits its own TF-IDF+SVD on the document it is
+# given. Sharing that would be actively wrong: one document's vocabulary and
+# singular vectors would silently shape another document's results.
+#
+# ⚠️ A shared encoder is READ-ONLY after construction. If one ever grows mutable
+# state, it must stop being shared or it will be a cross-window bug with no
+# symptom until the answers are subtly wrong.
+_SHARED_ENCODERS: dict[tuple, object] = {}
+_SHARED_LOCK = threading.RLock()
+
+
+def shared_encoder(kind: str, model_name: str, factory):
+    """Return the process-wide encoder for (kind, model), building it once.
+
+    `factory` is only called on a miss, so a download or a model load happens at
+    most once per process. Only successful builds are cached — an exception
+    propagates and nothing is stored.
+    """
+    key = (kind, model_name)
+    with _SHARED_LOCK:
+        encoder = _SHARED_ENCODERS.get(key)
+        if encoder is None:
+            encoder = factory()
+            _SHARED_ENCODERS[key] = encoder
+        return encoder
+
+
+def forget_shared_encoders() -> None:
+    """Drop the cached instances. Tests use this to stay independent."""
+    with _SHARED_LOCK:
+        _SHARED_ENCODERS.clear()
+
+
+def shared_encoder_count() -> int:
+    with _SHARED_LOCK:
+        return len(_SHARED_ENCODERS)
+
 
 VALID_KINDS = ("auto", "onnx", "neural", "lsa")
 LSA_NAME = "lsa-tfidf-svd"
@@ -109,8 +157,13 @@ def resolve(kind: str | None = None, model_name: str | None = None,
             ready = model_store.is_available(model_name)
             if ready or allow_download or kind == "onnx":
                 try:
-                    enc = OnnxEncoder(model_name, allow_download=allow_download or kind == "onnx",
-                                      progress=progress)
+                    # One ONNX session for the whole process; see shared_encoder.
+                    enc = shared_encoder(
+                        "onnx", model_name,
+                        lambda: OnnxEncoder(
+                            model_name,
+                            allow_download=allow_download or kind == "onnx",
+                            progress=progress))
                     note = ("real sentence encoder via ONNX; semantic paraphrase works"
                             if ready else "model downloaded to the local cache")
                     return EncoderChoice(enc, enc.model_name, "onnx", note)
@@ -134,7 +187,9 @@ def resolve(kind: str | None = None, model_name: str | None = None,
                 "    Or allow the fallback:  export RAGGY_ENCODER=auto")
         if neural_importable():
             try:
-                enc = NeuralIndex(model_name, cache_folder=cache_folder)
+                enc = shared_encoder(
+                    "neural", model_name,
+                    lambda: NeuralIndex(model_name, cache_folder=cache_folder))
                 return EncoderChoice(enc, enc.model_name, "neural",
                                      "real sentence encoder (torch); semantic paraphrase works")
             except Exception as e:                                  # noqa: BLE001

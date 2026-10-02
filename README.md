@@ -31,16 +31,29 @@ Cmd+F  "how do I fix an expired certificate on a replica"
 
 | | |
 |---|---|
-| `Cmd+N` / `Cmd+O` / `Cmd+S` / `Cmd+Shift+S` | New · Open · Save · Save As |
+| `Cmd+N` / `Cmd+O` / `Cmd+S` / `Cmd+Shift+S` | New window · Open · Save · Save As |
 | `Cmd+F` | Find (exact **and** meaning) |
 | `Cmd+Alt+F` | Find and Replace |
 | `Cmd+G` / `Cmd+Shift+G` | Find next / previous |
 | `Cmd+E` | Use selection for find |
 | `Cmd+L` | Go to line |
+| `Cmd+J` | Jump to selection |
 | `Cmd+=` / `Cmd+-` / `Cmd+0` | Zoom in · out · actual size |
-| `Cmd+P` | Print (and File ▸ Export as PDF…) |
+| `Cmd+Shift+P` / `Cmd+P` | Print preview · Print (also File ▸ Export as PDF…) |
 | `Esc` | Close the find bar |
 | `Cmd+Shift+A` | Ask a question about this document |
+
+**One document per window, the way TextEdit works.** `Cmd+N` opens a new window
+rather than resetting the one you are in; **Open** and **Open Recent** hand the
+file to an empty Untitled window if there is one and otherwise open a new window,
+so an open document is never disturbed. New windows cascade instead of landing on
+top of each other. Closing the last window leaves the app running — click its
+Dock icon to get a window back (and `Cmd+Q` to quit).
+
+⚠️ Every window shares one process-wide **neural encoder**, so ten open documents
+do not load ten copies of the model. Only the neural encoder is shared: LSA is
+fitted per document, and sharing it would leak one document's vocabulary into
+another's results.
 
 The window title is the **document name** — `Untitled` until you save — with the
 macOS proxy icon and the unsaved-changes dot, exactly as TextEdit shows them.
@@ -215,7 +228,7 @@ from **Help ▸ Enable Search by Meaning…**.
 ./run.sh install      # .venv with the full app stack (engine + GUI + ONNX)
 ./run.sh app          # launch the editor
 ./run.sh demo         # offline engine tour — no GUI, no model, no key
-./run.sh test         # 226 tests
+./run.sh test         # 252 tests
 ```
 
 ### Just the engine, no Qt
@@ -381,7 +394,7 @@ answer.
 
 ## Verified / not verified
 
-✅ **226 tests pass** (`./run.sh test`), hermetic — no network, no model download,
+✅ **252 tests pass** (`./run.sh test`), hermetic — no network, no model download,
 and the app's settings redirected into a scratch directory via
 `RAGGY_SETTINGS_DIR` so nothing touches your real preferences. ⚠️
 `QSettings.setPath()` is NOT enough on macOS: Qt ignores it and writes to

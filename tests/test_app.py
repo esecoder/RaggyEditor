@@ -1251,5 +1251,264 @@ class TestBundleDeclaresDocumentTypes(unittest.TestCase):
             self.assertIn(ext, spec)
 
 
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestWindows(unittest.TestCase):
+    """One window per document, the way TextEdit works.
+
+    ⚠️ `windows` is a process-wide registry, so every test here restores it.
+    Leaking a window would change the behaviour of whatever runs next.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from raggy.app import windows
+        self._saved = list(windows.windows)
+        self._ever = windows.ever_opened
+        windows.windows[:] = []
+        windows.ever_opened = False
+        self.addCleanup(self._restore, windows)
+
+    def _restore(self, windows):
+        for w in list(windows.windows):
+            w._mark_clean()
+            w.close()
+        windows.windows[:] = self._saved
+        windows.ever_opened = self._ever
+
+    def _clean(self, w):
+        w._index_timer.stop()
+        w._find_timer.stop()
+        w._save_timer.stop()
+        return w
+
+    # ---- the registry -----------------------------------------------------
+    def test_open_registers_shows_and_marks_the_app_as_started(self):
+        from raggy.app import windows
+        self.assertEqual(windows.count(), 0)
+        w = windows.open()
+        self._clean(w)
+        self.assertEqual(windows.count(), 1)
+        self.assertTrue(windows.ever_opened)
+        self.assertFalse(w.isHidden())
+
+    def test_forget_removes_it(self):
+        from raggy.app import windows
+        w = self._clean(windows.open())
+        windows.forget(w)
+        self.assertEqual(windows.count(), 0)
+
+    def test_forgetting_an_unknown_window_is_harmless(self):
+        from raggy.app import MainWindow, windows
+        w = self._clean(MainWindow())
+        windows.forget(w)                       # never registered
+        self.assertEqual(windows.count(), 0)
+        w._mark_clean()
+        w.close()
+
+    def test_the_cascade_rule_counts_open_windows(self):
+        # The rule itself, with no window manager involved: first window takes the
+        # remembered geometry, each later one steps once. <br>The platform adjusts
+        # positions when a window is shown, so the rule is pinned here rather than
+        # by reading back screen coordinates.
+        from raggy.app import WindowRegistry
+        registry = WindowRegistry()
+        steps = []
+        for _ in range(3):
+            steps.append(registry._cascade())
+            registry.windows.append(object())          # stand-in for a window
+        self.assertEqual(steps, [0, 1, 2])
+
+    def test_the_cascade_wraps_instead_of_marching_off_screen(self):
+        from raggy.app import WindowRegistry
+        registry = WindowRegistry()
+        registry.windows.extend(object() for _ in range(WindowRegistry.CASCADE_WRAP))
+        self.assertEqual(registry._cascade(), 0)
+
+    def test_new_windows_do_not_land_on_top_of_each_other(self):
+        # ⚠️ The observable property. Every window restores the same remembered
+        # rectangle, so without the cascade the user would see exactly one window.
+        from raggy.app import windows
+        for _ in range(3):
+            self._clean(windows.open())
+        xs = [w.pos().x() for w in windows.windows]
+        self.assertEqual(len(set(xs)), 3, f"windows stacked on top of each other: {xs}")
+        self.assertEqual(xs, sorted(xs), f"the cascade did not step down-right: {xs}")
+
+    # ---- is_pristine ------------------------------------------------------
+    def test_a_fresh_window_is_pristine(self):
+        from raggy.app import MainWindow
+        w = self._clean(MainWindow())
+        self.assertTrue(w.is_pristine())
+        w._mark_clean()
+        w.close()
+
+    def test_a_window_with_a_path_is_not_pristine(self):
+        from raggy.app import MainWindow
+        w = self._clean(MainWindow())
+        w.path = "/tmp/whatever.txt"
+        self.assertFalse(w.is_pristine())
+        w._mark_clean()
+        w.close()
+
+    def test_an_emptied_window_is_not_pristine(self):
+        # ⚠️ Typing and then deleting everything leaves an EMPTY window that is
+        # still the user's document. Reusing it would silently discard it.
+        from raggy.app import MainWindow
+        w = self._clean(MainWindow())
+        w.editor.setText("typed")
+        w.editor.setText("")
+        self.assertEqual(w.editor.text(), "")
+        self.assertFalse(w.is_pristine(), "an emptied document was treated as unused")
+        w._mark_clean()
+        w.close()
+
+    def test_a_window_with_only_a_format_change_is_not_pristine(self):
+        # `_is_dirty()` catches changes QScintilla's own flag misses.
+        from raggy.app import MainWindow
+        w = self._clean(MainWindow())
+        w.set_line_ending("\r\n")
+        self.assertFalse(w.is_pristine())
+        w._mark_clean()
+        w.close()
+
+    # ---- opening documents ------------------------------------------------
+    def test_open_document_reuses_an_empty_window(self):
+        from raggy.app import windows
+        tmp = tempfile.mkdtemp()
+        path = pathlib.Path(tmp, "a.txt")
+        path.write_text("document A\n", encoding="utf-8")
+
+        w = self._clean(windows.open())
+        target = self._clean(windows.open_document(str(path)))
+        self.assertIs(target, w, "it left a stranded empty window")
+        self.assertEqual(w.editor.text(), "document A\n")
+        self.assertEqual(windows.count(), 1)
+
+    def test_open_document_does_not_hijack_a_document(self):
+        from raggy.app import windows
+        tmp = tempfile.mkdtemp()
+        path = pathlib.Path(tmp, "b.txt")
+        path.write_text("document B\n", encoding="utf-8")
+
+        w = self._clean(windows.open())
+        w.editor.setText("work in progress")
+        target = self._clean(windows.open_document(str(path)))
+        self.assertIsNot(target, w)
+        self.assertEqual(w.editor.text(), "work in progress",
+                         "opening a file disturbed another document")
+        self.assertEqual(windows.count(), 2)
+
+    # ---- File > New -------------------------------------------------------
+    def test_new_window_leaves_the_current_document_alone(self):
+        # ⚠️ THE behaviour change: New used to reset this window, which threw away
+        # whatever was open.
+        from raggy.app import windows
+        w = self._clean(windows.open())
+        w.editor.setText("precious unsaved text")
+
+        w2 = self._clean(w.new_window())
+        self.assertEqual(w.editor.text(), "precious unsaved text")
+        self.assertEqual(w2.editor.text(), "")
+        self.assertEqual(windows.count(), 2)
+        self.assertIsNot(w2, w)
+
+    def test_the_file_menu_new_opens_a_window_rather_than_resetting(self):
+        from raggy.app import windows
+        w = self._clean(windows.open())
+        w.editor.setText("keep me")
+        file_menu = next(a.menu() for a in w.menuBar().actions()
+                         if a.text().replace("&", "") == "File")
+        new_action = next(a for a in file_menu.actions()
+                          if a.text().replace("&", "") == "New")
+        new_action.trigger()
+        self.assertEqual(windows.count(), 2)
+        self.assertEqual(w.editor.text(), "keep me")
+
+    # ---- lifecycle --------------------------------------------------------
+    def test_reopen_only_when_the_app_has_had_windows_and_has_none(self):
+        from raggy.app import should_reopen_window, windows
+        self.assertFalse(should_reopen_window(), "startup would open two windows")
+        w = self._clean(windows.open())
+        self.assertFalse(should_reopen_window(), "a window is already open")
+        windows.forget(w)
+        self.assertTrue(should_reopen_window(), "clicking the Dock icon did nothing")
+        self._clean(windows.open())
+        self.assertFalse(should_reopen_window())
+
+    def test_close_all_leaves_nothing_open(self):
+        from raggy.app import windows
+        self._clean(windows.open())
+        self._clean(windows.open())
+        windows.close_all()
+        self.assertEqual(windows.count(), 0)
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 + QScintilla not installed")
+class TestPrintPreview(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self):
+        from raggy.app import MainWindow
+        w = MainWindow()
+        w._index_timer.stop()
+        w._find_timer.stop()
+        w._save_timer.stop()
+        w.editor.setModified(False)
+        return w
+
+    def test_the_file_menu_offers_print_preview(self):
+        w = self._window()
+        file_menu = next(a.menu() for a in w.menuBar().actions()
+                         if a.text().replace("&", "") == "File")
+        labels = [a.text().replace("&", "") for a in file_menu.actions() if a.text()]
+        self.assertIn("Print Preview…", labels)
+        self.assertIn("Print…", labels)
+        w.close()
+
+    def test_preview_is_wired_to_the_same_renderer_as_print(self):
+        # ⚠️ The point of the preview is that it shows what Print will produce, so
+        # it must call the SAME layout code, not a second implementation.
+        from unittest import mock as _mock
+        seen = {}
+
+        class FakePreview:
+            class _Signal:
+                def __init__(self, sink):
+                    self._sink = sink
+
+                def connect(self, fn):
+                    self._sink["handler"] = fn
+
+            def __init__(self, printer, parent):
+                seen["printer"] = printer
+                self.paintRequested = self._Signal(seen)
+
+            def setWindowTitle(self, title):
+                seen["title"] = title
+
+            def exec(self):
+                seen["exec"] = True
+                return 0
+
+        w = self._window()
+        with _mock.patch("PyQt6.QtPrintSupport.QPrintPreviewDialog", FakePreview):
+            w.print_preview()
+        self.assertTrue(seen.get("exec"))
+        self.assertEqual(seen.get("title"), "Print Preview")
+        self.assertEqual(seen.get("handler"), w._render_to_device)
+        w.close()
+
+
 if __name__ == "__main__":
     unittest.main()
+

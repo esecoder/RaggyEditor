@@ -60,7 +60,7 @@ from raggy.printing import footer_text, paginate, rows_for_document, rows_per_pa
 
 try:
     from PyQt6 import Qsci
-    from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
+    from PyQt6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, pyqtSignal
     from PyQt6.QtGui import QAction, QColor, QKeySequence, QPageSize, QPalette
     from PyQt6.QtWidgets import (
         QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
@@ -553,9 +553,89 @@ if HAS_QT:
     # =========================================================================
     # WINDOW
     # =========================================================================
+    # =========================================================================
+    # WINDOWS — one per document, the way TextEdit works
+    # =========================================================================
+    class WindowRegistry:
+        """Holds the open editor windows.
+
+        ⚠️ Something has to hold a Python reference to each window. Qt keeps a C++
+        pointer for a shown widget, but not a Python reference to the wrapper: with
+        nothing in a list here, a window can be collected while it is still on
+        screen.
+
+        ⚠️ ONE `geometry` KEY IS SHARED BY EVERY WINDOW. New windows therefore
+        restore the remembered size and then step down and right, or every window
+        would open in exactly the same place and the user would see only one.
+        """
+
+        CASCADE_STEP = 26
+        #: After this many steps the cascade wraps, so windows do not march off the
+        #: bottom-right of the screen on the tenth document.
+        CASCADE_WRAP = 8
+
+        def __init__(self):
+            self.windows: list = []
+            #: True once a window has existed. Closing the last one leaves the app
+            #: running (macOS behaviour), and this is what distinguishes "the user
+            #: closed everything" from "the app just started".
+            self.ever_opened = False
+
+        # ------------------------------------------------------------ querying
+        def count(self) -> int:
+            return len(self.windows)
+
+        def pristine(self):
+            """The first empty, untitled, unmodified window, or None.
+
+            ⚠️ Searches ALL windows, not just "when there is exactly one".
+            Requiring a single window meant that opening a second file while an
+            empty Untitled window was already open created yet another window, and
+            empty Untitled windows then pile up one per Open. Handing the file to
+            the empty window is what TextEdit does, and it is the whole point of
+            the check.
+            """
+            for win in self.windows:
+                if win.is_pristine():
+                    return win
+            return None
+
+        # ------------------------------------------------------------- opening
+        def _cascade(self) -> int:
+            return 0 if not self.windows else len(self.windows) % self.CASCADE_WRAP
+
+        def open(self, path: str | None = None):
+            """Create, show and keep a new window. Returns it."""
+            win = MainWindow(path, cascade=self._cascade())
+            self.windows.append(win)
+            self.ever_opened = True
+            win.show()
+            return win
+
+        def open_document(self, path: str):
+            """Open a file, reusing an untouched window if there is one."""
+            reuse = self.pristine()
+            if reuse is not None:
+                reuse.load_path(path)
+                reuse.raise_()
+                reuse.activateWindow()
+                return reuse
+            return self.open(path)
+
+        # ------------------------------------------------------------- closing
+        def forget(self, win) -> None:
+            if win in self.windows:
+                self.windows.remove(win)
+
+        def close_all(self) -> None:
+            """Close every window without tripping the unsaved-changes prompt."""
+            for win in list(self.windows):
+                win._mark_clean()
+                win.close()
+
     class MainWindow(QMainWindow):
 
-        def __init__(self, path: str | None = None):
+        def __init__(self, path: str | None = None, cascade: int = 0):
             super().__init__()
             self.resize(980, 720)
 
@@ -607,7 +687,7 @@ if HAS_QT:
             self._apply_theme()
             self._apply_font()
             self._watch_theme()
-            self._restore_geometry()
+            self._restore_geometry(cascade)
             self._update_title()
 
             if path:
@@ -667,8 +747,8 @@ if HAS_QT:
             m = self.menuBar()
 
             f = m.addMenu("&File")
-            self._act(f, "&New", QKeySequence.StandardKey.New, self.new_file)
-            self._act(f, "&Open…", QKeySequence.StandardKey.Open, self.open_file)
+            self._act(f, "&New", QKeySequence.StandardKey.New, self.new_window)
+            self._act(f, "&Open…", QKeySequence.StandardKey.Open, self.open_window)
             self.recent_menu = f.addMenu("Open &Recent")
             self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
             f.addSeparator()
@@ -677,6 +757,7 @@ if HAS_QT:
             self._act(f, "Re&vert to Saved", None, self.revert_to_saved)
             f.addSeparator()
             self._act(f, "&Export as PDF…", None, self.export_pdf)
+            self._act(f, "Print Pre&view…", "Ctrl+Shift+P", self.print_preview)
             self._act(f, "&Print…", QKeySequence.StandardKey.Print, self.print_document)
             f.addSeparator()
             eol = f.addMenu("Line &Endings")
@@ -915,6 +996,41 @@ if HAS_QT:
                 return self.save_file()          # may have been cancelled in Save As
             return r == QMessageBox.StandardButton.Discard
 
+        def is_pristine(self) -> bool:
+            """Untitled, unmodified and empty — safe to reuse for another document.
+
+            ⚠️ Deliberately checks all three. An empty window the user has *typed
+            into and then deleted* is still their document, and so is one they have
+            converted to CRLF; `_is_dirty()` covers the cases QScintilla's own flag
+            misses.
+            """
+            return (self.path is None and not self._is_dirty()
+                    and not self.editor.text())
+
+        # ------------------------------------------------------- new windows
+        def new_window(self):
+            """File ▸ New: a NEW window, leaving this document alone.
+
+            ⚠️ Not `new_file()`, which resets THIS window. TextEdit gives each
+            document its own window, and replacing the current one would throw away
+            whatever the user had open — silently, if they had saved it.
+            """
+            win = windows.open()
+            win.editor.setFocus()
+            return win
+
+        def open_window(self):
+            """File ▸ Open: open the file in its own window.
+            
+            No unsaved-changes prompt is needed: nothing in this window is touched.
+            """
+            p, _ = QFileDialog.getOpenFileName(
+                self, "Open", os.path.expanduser("~"),
+                "Text files (*.txt *.md *.log *.csv *.json);;All files (*)")
+            if p:
+                target = windows.open_document(p)
+                target.editor.setFocus()
+
         def new_file(self):
             if not self._confirm_discard():
                 return
@@ -933,15 +1049,6 @@ if HAS_QT:
             self._update_line_ending_menu()
             self._close_find()
             self.editor.setFocus()
-
-        def open_file(self):
-            if not self._confirm_discard():
-                return
-            p, _ = QFileDialog.getOpenFileName(
-                self, "Open", os.path.expanduser("~"),
-                "Text files (*.txt *.md *.log *.csv *.json);;All files (*)")
-            if p:
-                self.load_path(p)
 
         def load_path(self, path: str, warn_encoding: bool = True):
             """Open a file, remembering its exact on-disk format."""
@@ -1109,13 +1216,19 @@ if HAS_QT:
             self._index_document()
 
         # ------------------------------------------------------- geometry
-        def _restore_geometry(self):
+        def _restore_geometry(self, cascade: int = 0):
             saved = self._settings.value("geometry")
             if saved:
                 try:
                     self.restoreGeometry(saved)
                 except Exception:                                   # noqa: BLE001
                     pass
+            if cascade:
+                # ⚠️ Every window restores the SAME remembered rectangle, so without
+                # this they would all land on top of one another and look like one
+                # window. Step down and right instead, which is what TextEdit does.
+                step = WindowRegistry.CASCADE_STEP * cascade
+                self.move(self.x() + step, self.y() + step)
 
         def _save_geometry(self):
             try:
@@ -1207,6 +1320,22 @@ if HAS_QT:
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self._render_to_device(printer)
 
+        def print_preview(self):
+            """Show the pages before committing paper to them.
+
+            ⚠️ This is nearly free because `_render_to_device` draws onto whatever
+            paged device it is handed, and the preview dialog hands us a QPrinter
+            through `paintRequested`. The preview therefore shows exactly what
+            Print will produce — same layout code, not a second implementation.
+            """
+            from PyQt6.QtPrintSupport import QPrintPreviewDialog, QPrinter
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+            dlg = QPrintPreviewDialog(printer, self)
+            dlg.setWindowTitle("Print Preview")
+            dlg.paintRequested.connect(self._render_to_device)
+            dlg.exec()
+
         def export_pdf(self):
             from PyQt6.QtGui import QPdfWriter
             suggested = os.path.expanduser("~")
@@ -1263,8 +1392,9 @@ if HAS_QT:
                 self._settings.setValue(
                     "recent", [p for p in self._recent_paths() if p != path])
                 return
-            if self._confirm_discard():
-                self.load_path(path)
+            # ⚠️ A new window, not this one: opening a file must not disturb a
+            # document the user already has open, and so must not prompt either.
+            windows.open_document(path)
 
         # --------------------------------------------------- transformations
         def transform_case(self, mode: str):
@@ -1750,7 +1880,12 @@ if HAS_QT:
             self._forget_snapshot()
             self._save_timer.stop()
             self._save_geometry()
+            windows.forget(self)
             event.accept()
+
+    #: The open windows. Created after MainWindow so the two can refer to each
+    #: other without a forward reference.
+    windows = WindowRegistry()
 
 else:  # pragma: no cover
 
@@ -1767,7 +1902,7 @@ else:  # pragma: no cover
         pass
 
 
-def _offer_recovery(win) -> None:
+def _offer_recovery(win=None) -> None:
     """Offer unsaved work from a previous session, if any survived.
 
     ⚠️ Runs AFTER the window is shown, and only offers snapshots that are newer
@@ -1797,12 +1932,48 @@ def _offer_recovery(win) -> None:
         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         | QMessageBox.StandardButton.Discard)
     if r == QMessageBox.StandardButton.Yes:
-        win.restore_snapshot(pending[0])
+        # Restore into the empty window the app started with when there is one,
+        # rather than leaving a stranded empty window next to the recovered one.
+        target = win if (win is not None and win.is_pristine()) else windows.open()
+        target.restore_snapshot(pending[0])
     elif r == QMessageBox.StandardButton.Discard:
         try:
             recovery.clear_all()
         except Exception:                                           # noqa: BLE001
             pass
+
+
+class RaggyApplication(QApplication):
+    """QApplication that reopens a window when the user has closed them all.
+
+    ⚠️ The default, `quitOnLastWindowClosed=True`, quits the process as soon as the
+    last document closes. On macOS that is wrong for a document application: the
+    app should stay running with no windows, and clicking its Dock icon should
+    bring a new document window back. It also means the recovery check is not run
+    again on every Dock click, which is what would happen if the process restarted.
+    """
+
+    def __init__(self, argv):
+        super().__init__(argv)
+        self.setQuitOnLastWindowClosed(False)
+
+    def event(self, event):                                     # noqa: D102
+        if event.type() == QEvent.Type.ApplicationActivate and should_reopen_window():
+            windows.open()
+        return super().event(event)
+
+
+def should_reopen_window() -> bool:
+    """Should activating the application bring a window back?
+
+    ⚠️ Pulled out of `RaggyApplication.event` so it can be tested: a second
+    QApplication cannot be constructed in the test process, so the rule would
+    otherwise have no coverage at all.
+
+    ⚠️ `ever_opened` matters. Without it, the activation during startup would
+    create a window in addition to the one main() is about to open.
+    """
+    return windows.ever_opened and windows.count() == 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1816,10 +1987,9 @@ def main(argv: list[str] | None = None) -> int:
               "(the engine and CLI still work without them: ./run.sh demo)")
         return 1
     path = argv[1] if len(argv) > 1 else None
-    app = QApplication(argv)
+    app = RaggyApplication(argv)
     app.setApplicationName(APP_NAME)
-    win = MainWindow(path)
-    win.show()
+    win = windows.open(path)
     if selftest:
         print("selftest: window constructed OK")
         QTimer.singleShot(0, app.quit)
