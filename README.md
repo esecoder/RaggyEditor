@@ -18,7 +18,7 @@ Both use the same TextEdit-style bar above the document, and there is still no
 side panel. `Enter` / `Shift+Enter` (or the chevrons) walk the results; **Done**
 closes the bar.
 
-⚠️ **THE TWO ARE SEPARATE, AND THEIR RESULTS ARE NEVER MIXED.** An earlier version
+ **THE TWO ARE SEPARATE, AND THEIR RESULTS ARE NEVER MIXED.** An earlier version
 fused them into one box, and in use that was nonsense: the count read
 `3 of 12 · 4 exact · 8 related`, one number adding up two unrelated things;
 next/previous stepped between a literal hit and a passage from the other end of
@@ -44,7 +44,7 @@ Cmd+Shift+F  "how do I fix an expired certificate on a replica"
 
 ### Chunk size is what breaks semantic search, not the model
 
-⚠️ The most serious bug this project has had, because every part of it was silent.
+ The most serious bug this project has had, because every part of it was silent.
 `_pack_spans` decides where to **stop** packing; it had no way to **split** a unit
 that was already larger than the target, and emitted those whole. On a real 946 KB
 notes file that produced:
@@ -103,7 +103,7 @@ so an open document is never disturbed. New windows cascade instead of landing o
 top of each other. Closing the last window leaves the app running — click its
 Dock icon to get a window back (and `Cmd+Q` to quit).
 
-⚠️ Every window shares one process-wide **neural encoder**, so ten open documents
+ Every window shares one process-wide **neural encoder**, so ten open documents
 do not load ten copies of the model. Only the neural encoder is shared: LSA is
 fitted per document, and sharing it would leak one document's vocabulary into
 another's results.
@@ -121,7 +121,7 @@ set explicitly.
 The find bar has a **Replace** disclosure that reveals a replace row with
 **Replace** and **Replace All**. A whole replace run is a single undo step.
 
-⚠️ Replace operates on **literal matches only**. A "related" passage came back
+ Replace operates on **literal matches only**. A "related" passage came back
 because it is *about* the same subject, not because it contains what you typed —
 rewriting it would edit text you never searched for. When a search returns only
 meaning matches, the replace controls are disabled and say why.
@@ -137,7 +137,7 @@ breaks. The promise that matters: **with wrapping off, printed row N is document
 line N**, so a printed "line 61" matches line 61 in the window. There is a small
 page footer with the file name and `page n of m`.
 
-⚠️ The first version handed the text to Qt's `QTextDocument`, which prints *the
+ The first version handed the text to Qt's `QTextDocument`, which prints *the
 text content* — it re-wraps at its own width, ignores the editor's wrap setting
 and indentation, and gives no way to keep the two in step. `raggy/printing.py`
 computes the layout instead, and takes the width measurement as an argument, so
@@ -149,7 +149,7 @@ the wrapping and paging rules are unit-tested without a window or a printer.
 and the choice is remembered. Light is a pure `#ffffff` page — verified by
 sampling the rendered pixels, not by reading a colour constant.
 
-⚠️ The pane and the dialogs are themed from **one** palette (`THEME` in
+ The pane and the dialogs are themed from **one** palette (`THEME` in
 `app.py`), because QScintilla ignores the application palette entirely and is
 coloured by hand. Before that, the two drifted apart: a dark pane next to dialogs
 whose secondary text was `palette(mid)` — grey on grey. Two more traps live in
@@ -171,7 +171,7 @@ is a property of the plain-text format, not a bug — TextEdit only persists
 formatting because it can save Rich Text. Making it stick means saving as
 RTF/HTML, which is a different feature; it is not implemented.
 
-⚠️ The styles are numbers 40-42. Scintilla reserves 0-39 (`STYLE_DEFAULT` is 32,
+ The styles are numbers 40-42. Scintilla reserves 0-39 (`STYLE_DEFAULT` is 32,
 line numbers 33), and a collision there shows up as unexplained underlining
 somewhere else in the document. `STYLECLEARALL` is also skipped once the document
 carries styles, because it resets every character to the default and would wipe
@@ -184,7 +184,7 @@ notation under the caret is rendered in a strip below the editor — superscript
 subscripts, Greek letters, operators, arrows and chemical formulae. **View ▸
 Show Formula Preview** turns it off.
 
-⚠️ **This is not a LaTeX engine.** A real one means matplotlib's mathtext (~40 MB,
+ **This is not a LaTeX engine.** A real one means matplotlib's mathtext (~40 MB,
 deliberately excluded from the bundle), KaTeX or MathJax (QtWebEngine, larger
 still). `raggy/formulas.py` is a recogniser and a presentational converter with no
 dependencies at all, and it passes anything it does not understand through
@@ -208,7 +208,7 @@ title, the recent-files list and the recovery slot. It takes a **name**, not a
 path — a folder separator is refused rather than quietly turning "Rename" into
 "move the file somewhere else". An untitled document falls back to Save As.
 
-⚠️ **What this is not.** TextEdit lets you rename from the document chip in its
+ **What this is not.** TextEdit lets you rename from the document chip in its
 title bar. Qt gives a macOS window a document **proxy icon** (that is
 `setWindowFilePath`, applied in `_update_title`) whose click popup macOS builds
 itself — and Qt does not expose it, so a "Rename" entry cannot be added to it.
@@ -223,7 +223,7 @@ Opening and saving a document reproduces its **exact format** — encoding, BOM 
 line endings. `File ▸ Line Endings` converts deliberately (LF / CRLF / CR), and
 that conversion counts as an unsaved change.
 
-⚠️ Earlier versions read every file as UTF-8 and wrote it back the same way, so a
+ Earlier versions read every file as UTF-8 and wrote it back the same way, so a
 Windows file came back as LF and a Latin-1 file came back as UTF-8, with no
 warning. A file that is not valid UTF-8 is now opened as Latin-1 and the app
 **says so** rather than pretending it understood. See `raggy/textfile.py`; the
@@ -235,7 +235,7 @@ While a document has unsaved changes the app writes a snapshot every few seconds
 to `~/.config/RaggyEditor/recovery/` (mode `0600`, directory `0700` — it holds
 your text in plain form). On the next launch it offers to restore.
 
-⚠️ A snapshot is only offered when it is **newer than the file on disk**. If you
+ A snapshot is only offered when it is **newer than the file on disk**. If you
 saved and *then* the app died, restoring would silently roll you backwards — a
 data-loss bug wearing a safety net's clothes, so `recovery.pending()` enforces the
 rule and a test pins it. An **untitled** document is always offered: it exists
@@ -247,7 +247,7 @@ nowhere else.
 a dialog, not a permanent pane. Retrieval is local and always works; **writing a
 cited answer needs a language model.**
 
-⚠️ Retrieval and generation are different things, and the 133 MB download is only
+ Retrieval and generation are different things, and the 133 MB download is only
 the first one:
 
 | | Needs | Works offline |
@@ -268,7 +268,7 @@ There is a **Test Connection** button, so you find out immediately whether it
 works rather than when you next need an answer. If no model is connected, the Ask
 dialog shows a **Set Up AI Answers…** button instead of leaving you to guess.
 
-The key is stored in `~/.config/RaggyEditor/ai.json` with mode `0600`. ⚠️ It is
+The key is stored in `~/.config/RaggyEditor/ai.json` with mode `0600`.  It is
 **plain text and not encrypted** — file permissions are the only protection. Set
 `OPENAI_API_KEY` in the environment instead if you would rather not write it to
 disk.
@@ -346,7 +346,7 @@ matches nothing exactly, the app offers — once — to download the language mo
 (~133 MB) that lets it also find passages by meaning. You can also trigger it
 from **Help ▸ Enable Search by Meaning…**.
 
-> ⚠️ The build is **unsigned**, so macOS Gatekeeper and Windows SmartScreen will
+>  The build is **unsigned**, so macOS Gatekeeper and Windows SmartScreen will
 > warn on first launch (right-click ▸ Open on macOS). See **Shipping** below.
 
 ### From source (developer)
@@ -406,7 +406,7 @@ is **calibrated**, not guessed:
   abstains on answerable   (harmful) :  15.4%
 ```
 
-⚠️ A measured surprise that shaped the design: **embedding similarity is not what
+ A measured surprise that shaped the design: **embedding similarity is not what
 separates answerable from unanswerable.** Neural top-cosine runs 0.61–0.77 for
 answerable and 0.42–0.68 for *out-of-scope* — they overlap. Something always
 looks "similar". The signal that separates is whether the document actually uses
@@ -431,7 +431,7 @@ position**, so an edit that shifts every later passage still reuses them.
 - A re-index with **no change** is **7 ms**, because nothing is encoded.
 - **LSA gets no speedup, and the table says so**: TF-IDF and the SVD basis are
   fit corpus-wide, so an edit changes every vector. A property of LSA, not a bug.
-- ⚠️ **The correctness guarantee is tested**: an incremental re-index must be
+-  **The correctness guarantee is tested**: an incremental re-index must be
   *indistinguishable* from a cold rebuild — same passages, offsets and ranking.
   A cache's failure mode is not a crash; it is results that look fine and are
   wrong.
@@ -489,7 +489,7 @@ produces a working app*, and the difference is usually a missing Qt plugin.
 | `dist/RaggyEditor.app` (macOS, uncompressed) | 289 MB |
 | `dist/RaggyEditor.dmg` (**the download**) | **57 MB** |
 
-⚠️ **Unsigned builds warn.** To ship without warnings you need, per platform:
+ **Unsigned builds warn.** To ship without warnings you need, per platform:
 
 - **macOS**: an Apple Developer ID, `codesign --deep --options runtime`, then
   `notarytool submit` + `stapler staple`. Without it, macOS refuses to open the
@@ -497,7 +497,7 @@ produces a working app*, and the difference is usually a missing Qt plugin.
 - **Windows**: an Authenticode certificate, or SmartScreen warns.
 - **Linux**: ship the AppImage or tarball; no signing authority.
 
-⚠️ **Each OS builds its own artifact.** PyInstaller does not cross-compile — a
+ **Each OS builds its own artifact.** PyInstaller does not cross-compile — a
 Windows `.exe` must be built on Windows, a Linux binary on Linux. A CI matrix
 (GitHub Actions `macos-latest` / `windows-latest` / `ubuntu-latest`) is the usual
 answer.
@@ -523,13 +523,13 @@ answer.
 
 ✅ **331 tests pass** (`./run.sh test`), hermetic — no network, no model download,
 and the app's settings redirected into a scratch directory via
-`RAGGY_SETTINGS_DIR` so nothing touches your real preferences. ⚠️
+`RAGGY_SETTINGS_DIR` so nothing touches your real preferences. 
 `QSettings.setPath()` is NOT enough on macOS: Qt ignores it and writes to
 `~/Library/Preferences` anyway, which is how a test once left `font_size = 72`
 behind.
 ✅ The offset invariant (`chunk.text == document[start:end]`) is asserted in the
 chunker **and** tested for every strategy, so highlight-jump cannot drift.
-✅ ⚠️ **Character offsets are converted to UTF-8 byte offsets** at the Scintilla
+✅  **Character offsets are converted to UTF-8 byte offsets** at the Scintilla
 boundary (`raggy/offsets.py`). This was a real bug: the editor highlighted the
 wrong text in any document containing a non-ASCII character before the match.
 The old tests missed it because they compared the *numbers* the engine produced
@@ -549,11 +549,11 @@ cache-invalidation rules (different document, different encoder) are tested.
 ✅ Retrieval and cost numbers above are produced by `./run.sh eval` and
 `./run.sh bench` on this machine.
 
-⚠️ **Not verified:** Windows and Linux packaging (only macOS was built here);
+ **Not verified:** Windows and Linux packaging (only macOS was built here);
 code signing / notarisation; and the legacy CudaText plugin, which is not
 executed by the test suite.
 
-⚠️ The eval set is 19 queries on one document. Enough to show the shape of the
+ The eval set is 19 queries on one document. Enough to show the shape of the
 result, not to publish a benchmark. **Re-run `./run.sh eval` on your document** —
 chunk size and threshold are corpus-specific.
 
@@ -569,7 +569,7 @@ and linking them makes the combined work GPLv3. The permissive parts:
 - **ONNX Runtime**, **numpy**, **tokenizers** are MIT/Apache-2.0.
 - **CudaText**, whose plugin is kept in this repo, is BSD-3-Clause.
 
-⚠️ If you need RaggyEditor under a **permissive** licence, the swap is
+ If you need RaggyEditor under a **permissive** licence, the swap is
 `PyQt6 → PySide6` (LGPLv3) plus Qt's built-in `QPlainTextEdit` instead of
 QScintilla — at the cost of the Scintilla editing surface. Everything in
 `src/raggy/` except `app.py` has no Qt dependency at all and can be MIT on its
